@@ -45,7 +45,7 @@ int queue_new_packet(struct pkt_q *q, void *buf, int len)
 
 /* This is here because it's generic and hence can't live in either of the
    tun*.c files for specific platforms */
-int tun_mainloop(struct openconnect_info *vpninfo, int *timeout)
+int tun_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 {
 	struct pkt *this;
 	int work_done = 0;
@@ -58,7 +58,7 @@ int tun_mainloop(struct openconnect_info *vpninfo, int *timeout)
 		return 0;
 	}
 
-	if (read_fd_monitored(vpninfo, tun)) {
+	if (readable && read_fd_monitored(vpninfo, tun)) {
 		struct pkt *out_pkt = vpninfo->tun_pkt;
 		while (1) {
 			int len = vpninfo->ip_info.mtu;
@@ -177,7 +177,7 @@ int openconnect_mainloop(struct openconnect_info *vpninfo,
 			 int reconnect_interval)
 {
 	int ret = 0;
-
+	int tun_r = 1, udp_r = 1, tcp_r = 1;
 	vpninfo->reconnect_timeout = reconnect_timeout;
 	vpninfo->reconnect_interval = reconnect_interval;
 
@@ -196,6 +196,7 @@ int openconnect_mainloop(struct openconnect_info *vpninfo,
 		struct timeval tv;
 		fd_set rfds, wfds, efds;
 #endif
+
 		/* If tun is not up, loop more often to detect
 		 * a DTLS timeout (due to a firewall block) as soon. */
 		if (tun_is_up(vpninfo))
@@ -216,7 +217,7 @@ int openconnect_mainloop(struct openconnect_info *vpninfo,
 				}
 			}
 
-			ret = vpninfo->proto->udp_mainloop(vpninfo, &timeout);
+			ret = vpninfo->proto->udp_mainloop(vpninfo, &timeout, udp_r);
 			if (vpninfo->quit_reason)
 				break;
 			did_work += ret;
@@ -228,14 +229,14 @@ int openconnect_mainloop(struct openconnect_info *vpninfo,
 				break;
 		}
 
-		ret = vpninfo->proto->tcp_mainloop(vpninfo, &timeout);
+		ret = vpninfo->proto->tcp_mainloop(vpninfo, &timeout, tcp_r);
 		if (vpninfo->quit_reason)
 			break;
 		did_work += ret;
 
 		/* Tun must be last because it will set/clear its bit
 		   in the select_rfds according to the queue length */
-		did_work += tun_mainloop(vpninfo, &timeout);
+		did_work += tun_mainloop(vpninfo, &timeout, tun_r);
 		if (vpninfo->quit_reason)
 			break;
 
@@ -303,6 +304,9 @@ int openconnect_mainloop(struct openconnect_info *vpninfo,
 		tv.tv_usec = (timeout % 1000) * 1000;
 
 		select(vpninfo->_select_nfds, &rfds, &wfds, &efds, &tv);
+		tun_r = FD_ISSET(vpninfo->tun_fd, &rfds);
+		udp_r = FD_ISSET(vpninfo->dtls_fd, &rfds);
+		tcp_r = FD_ISSET(vpninfo->ssl_fd, &rfds);
 #endif
 	}
 
