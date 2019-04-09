@@ -81,8 +81,8 @@ int setup_esp_keys(struct openconnect_info *vpninfo, int new_keys)
 
 	if (vpninfo->dtls_state == DTLS_DISABLED)
 		return -EOPNOTSUPP;
-	if (!vpninfo->dtls_addr)
-		return -EINVAL;
+	if (!vpninfo->dtls_addr) {printf("no addr\n");
+		return -EINVAL;}
 
 	switch (vpninfo->esp_enc) {
 	case 0x02:
@@ -106,6 +106,7 @@ int setup_esp_keys(struct openconnect_info *vpninfo, int new_keys)
 		return -EINVAL;
 	}
 
+	printf("enc %d mac %d\n", encalg, macalg);
 	if (new_keys) {
 		vpninfo->old_esp_maxseq = vpninfo->esp_in[vpninfo->current_esp_in].seq + 32;
 		vpninfo->current_esp_in ^= 1;

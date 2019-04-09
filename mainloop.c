@@ -64,7 +64,7 @@ int tun_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 			int len = vpninfo->ip_info.mtu;
 
 			if (!out_pkt) {
-				out_pkt = malloc(sizeof(struct pkt) + len + vpninfo->pkt_trailer);
+				out_pkt = pkt_alloc(vpninfo, sizeof(struct pkt) + len + vpninfo->pkt_trailer);
 				if (!out_pkt) {
 					vpn_progress(vpninfo, PRG_ERR, _("Allocation failed\n"));
 					break;
@@ -104,7 +104,7 @@ int tun_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 		vpninfo->stats.rx_pkts++;
 		vpninfo->stats.rx_bytes += this->len;
 
-		free(this);
+		pkt_free(vpninfo, this);
 	}
 	/* Work is not done if we just got rid of packets off the queue */
 	return work_done;
@@ -196,7 +196,6 @@ int openconnect_mainloop(struct openconnect_info *vpninfo,
 		struct timeval tv;
 		fd_set rfds, wfds, efds;
 #endif
-
 		/* If tun is not up, loop more often to detect
 		 * a DTLS timeout (due to a firewall block) as soon. */
 		if (tun_is_up(vpninfo))
