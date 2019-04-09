@@ -526,6 +526,7 @@ struct openconnect_info {
 	struct pkt *cstp_pkt;
 	struct pkt *dtls_pkt;
 	struct pkt *tun_pkt;
+	struct pkt *pkt_pool;
 	int pkt_trailer; /* How many bytes after payload for encryption (ESP HMAC) */
 
 	z_stream inflate_strm;
@@ -798,6 +799,23 @@ OPENCONNECT_CMD_SOCKET dumb_socketpair(OPENCONNECT_CMD_SOCKET socks[2], int make
     } while (0)
 
 /****************************************************************************/
+
+
+
+static inline struct pkt *pkt_alloc(struct openconnect_info *vpninfo, int len)
+{
+	struct pkt *ret = vpninfo->pkt_pool;
+	if (ret)
+		vpninfo->pkt_pool = ret->next;
+	else
+		ret = malloc(len);
+	return ret;
+}
+static inline void pkt_free(struct openconnect_info *vpninfo, struct pkt *pkt)
+{
+	pkt->next = vpninfo->pkt_pool;
+	vpninfo->pkt_pool = pkt;
+}
 
 /* iconv.c */
 #ifdef HAVE_ICONV
