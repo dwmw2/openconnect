@@ -23,7 +23,7 @@ AM_CPPFLAGS = -DLOCALEDIR="\"$(localedir)\""
 openconnect_SOURCES = xml.c main.c
 openconnect_CFLAGS = $(AM_CFLAGS) $(SSL_CFLAGS) $(DTLS_SSL_CFLAGS) $(LIBXML2_CFLAGS) $(LIBPROXY_CFLAGS) $(ZLIB_CFLAGS) $(LIBSTOKEN_CFLAGS) $(LIBPSKC_CFLAGS) $(GSSAPI_CFLAGS) $(INTL_CFLAGS) $(ICONV_CFLAGS) $(LIBPCSCLITE_CFLAGS)
 openconnect_LDADD = libopenconnect.la $(SSL_LIBS) $(LIBXML2_LIBS) $(LIBPROXY_LIBS) $(INTL_LIBS) $(ICONV_LIBS)
-
+export openconnect_CFLAGS
 if OPENCONNECT_WIN32
 openconnect_SOURCES += openconnect.rc
 endif
@@ -32,7 +32,7 @@ lib_srcs_cisco = auth.c cstp.c
 lib_srcs_juniper = oncp.c lzo.c auth-juniper.c
 lib_srcs_globalprotect = gpst.c auth-globalprotect.c
 lib_srcs_gnutls = gnutls.c gnutls_tpm.c gnutls_tpm2.c
-lib_srcs_openssl = openssl.c openssl-pkcs11.c
+lib_srcs_openssl = openssl.c openssl-pkcs11.c aesni-sha1-x86_64.s aesni-x86_64.s
 lib_srcs_win32 = tun-win32.c sspi.c
 lib_srcs_posix = tun.c
 lib_srcs_gssapi = gssapi.c

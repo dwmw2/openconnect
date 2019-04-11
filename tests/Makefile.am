@@ -79,7 +79,10 @@ TESTS_ENVIRONMENT = srcdir="$(srcdir)" \
 	pkcs11_tokens="$(PKCS11_TOKENS)"
 
 
-C_TESTS = lzstest seqtest
+C_TESTS = lzstest seqtest esptest
+
+esptest_CFLAGS = $(openconnect_CFLAGS)
+esptest_LDADD = ../libopenconnect.la
 
 
 if CHECK_DTLS

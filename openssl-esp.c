@@ -82,9 +82,10 @@ static int init_esp_ciphers(struct openconnect_info *vpninfo, struct esp *esp,
 
 	if (decrypt)
 		ret = EVP_DecryptInit_ex(esp->cipher, encalg, NULL, esp->enc_key, NULL);
-	else
-		ret = EVP_EncryptInit_ex(esp->cipher, encalg, NULL, esp->enc_key, NULL);
-
+	else {
+		ret = RAND_bytes((void *)esp->iv, sizeof(esp->iv)) &&
+			EVP_EncryptInit_ex(esp->cipher, encalg, NULL, esp->enc_key, esp->iv);
+	}
 	if (!ret) {
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Failed to initialise ESP cipher:\n"));
@@ -106,7 +107,9 @@ static int init_esp_ciphers(struct openconnect_info *vpninfo, struct esp *esp,
 
 		openconnect_report_ssl_errors(vpninfo);
 		destroy_esp_ciphers(esp);
+		return -EIO;
 	}
+
 	esp->seq = 0;
 	esp->seq_backlog = 0;
 	return 0;
@@ -220,7 +223,7 @@ int decrypt_esp_packet(struct openconnect_info *vpninfo, struct esp *esp, struct
 	return 0;
 }
 
-int encrypt_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt)
+static int old_encrypt_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt)
 {
 	int i, padlen;
 	const int blksize = 16;
@@ -230,26 +233,15 @@ int encrypt_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt)
 	/* This gets much more fun if the IV is variable-length */
 	pkt->esp.spi = vpninfo->esp_out.spi;
 	pkt->esp.seq = htonl(vpninfo->esp_out.seq++);
-	if (!RAND_bytes((void *)&pkt->esp.iv, sizeof(pkt->esp.iv))) {
-		vpn_progress(vpninfo, PRG_ERR,
-			     _("Failed to generate random IV for ESP packet:\n"));
-		openconnect_report_ssl_errors(vpninfo);
-		return -EIO;
-	}
+
+	/* This is the current IV from the EVP_CIPHER_CTX */
+	memcpy(pkt->esp.iv, vpninfo->esp_out.iv, sizeof(pkt->esp.iv));
 
 	padlen = blksize - 1 - ((pkt->len + 1) % blksize);
 	for (i=0; i<padlen; i++)
 		pkt->data[pkt->len + i] = i + 1;
 	pkt->data[pkt->len + padlen] = padlen;
 	pkt->data[pkt->len + padlen + 1] = 0x04; /* Legacy IP */
-
-	if (!EVP_EncryptInit_ex(vpninfo->esp_out.cipher, NULL, NULL, NULL,
-				pkt->esp.iv)) {
-		vpn_progress(vpninfo, PRG_ERR,
-			     _("Failed to set up encryption context for ESP packet:\n"));
-		openconnect_report_ssl_errors(vpninfo);
-		return -EINVAL;
-	}
 
 	crypt_len = pkt->len + padlen + 2;
 	if (!EVP_EncryptUpdate(vpninfo->esp_out.cipher, pkt->data, &crypt_len,
@@ -260,10 +252,104 @@ int encrypt_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt)
 		return -EINVAL;
 	}
 
-	HMAC_CTX_copy(vpninfo->esp_out.pkt_hmac, vpninfo->esp_out.hmac);
-	HMAC_Update(vpninfo->esp_out.pkt_hmac, (void *)&pkt->esp, sizeof(pkt->esp) + crypt_len);
-	HMAC_Final(vpninfo->esp_out.pkt_hmac, pkt->data + crypt_len, &hmac_len);
-	HMAC_CTX_reset(vpninfo->esp_out.pkt_hmac);
+	/* IV for next time. */
+	memcpy(vpninfo->esp_out.iv, pkt->data + crypt_len - 16, 16);
+
+	HMAC_Init_ex(vpninfo->esp_out.hmac, NULL, 0, NULL, NULL);
+	HMAC_Update(vpninfo->esp_out.hmac, (void *)&pkt->esp, sizeof(pkt->esp) + crypt_len);
+	HMAC_Final(vpninfo->esp_out.hmac, pkt->data + crypt_len, &hmac_len);
 
 	return sizeof(pkt->esp) + crypt_len + 12;
 }
+int OPENSSL_ia32cap_P[4] = { -1, -1, -1, -1 };
+#if 1
+#include <openssl/aes.h>
+
+#define HMAC_MAX_MD_CBLOCK_SIZE     144
+
+struct hmac_ctx_st {
+    const EVP_MD *md;
+    EVP_MD_CTX *md_ctx;
+    EVP_MD_CTX *i_ctx;
+    EVP_MD_CTX *o_ctx;
+    unsigned int key_length;
+    unsigned char key[HMAC_MAX_MD_CBLOCK_SIZE];
+};
+void aesni_cbc_encrypt(const unsigned char *in,
+                       unsigned char *out,
+                       size_t length,
+                       const AES_KEY *key, unsigned char *ivec, int enc);
+void aesni_cbc_sha1_enc(const void *inp, void *out, size_t blocks,
+                        const AES_KEY *key, unsigned char iv[16],
+                        SHA_CTX *ctx, const void *in0);
+
+
+int encrypt_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt)
+{
+	int i, padlen;
+	const int blksize = 16;
+	unsigned int hmac_len = 20;
+	int crypt_len;
+	AES_KEY *ak;
+	int stitched;
+	SHA_CTX *sha;
+
+#define PRECBC 64
+#define BLK 64
+	if (pkt->len < PRECBC + BLK)
+		return old_encrypt_esp_packet(vpninfo, pkt);
+
+	/* This gets much more fun if the IV is variable-length */
+	pkt->esp.spi = vpninfo->esp_out.spi;
+	pkt->esp.seq = htonl(vpninfo->esp_out.seq++);
+
+	memcpy(pkt->esp.iv, vpninfo->esp_out.iv, sizeof(pkt->esp.iv));
+
+	padlen = blksize - 1 - ((pkt->len + 1) % blksize);
+	for (i=0; i<padlen; i++)
+		pkt->data[pkt->len + i] = i + 1;
+	pkt->data[pkt->len + padlen] = padlen;
+	pkt->data[pkt->len + padlen + 1] = 0x04; /* Legacy IP */
+
+	crypt_len = pkt->len + padlen + 2;
+
+	/* It's actually an EVP_AES_KEY but the AES_KEY is first in that. */
+	ak = EVP_CIPHER_CTX_get_cipher_data(vpninfo->esp_out.cipher);
+	/* Encrypt the first block */
+	aesni_cbc_encrypt(pkt->data, pkt->data, PRECBC, ak, (unsigned char *)&vpninfo->esp_out.iv, 1);
+
+	/* Then the stitched part */
+	stitched = (crypt_len-PRECBC) / BLK;
+	HMAC_Init_ex(vpninfo->esp_out.hmac, NULL, 0, NULL, NULL);
+	sha = EVP_MD_CTX_md_data(vpninfo->esp_out.hmac->md_ctx);
+	aesni_cbc_sha1_enc(pkt->data + PRECBC, pkt->data + PRECBC, stitched, ak, (unsigned char *)&vpninfo->esp_out.iv,
+			   sha, &pkt->esp);
+	sha->Nl += (stitched * BLK) << 3;
+
+	//	printf("hashed %d bytes at %p; next %p\n", stitched * BLK, &pkt->esp, ((void *)&pkt->esp)+(stitched * BLK));
+
+#if 0 /* Hm, the hashing isn't working right ... */
+	HMAC_CTX_copy(vpninfo->esp_out.pkt_hmac, vpninfo->esp_out.hmac);
+	sha = EVP_MD_CTX_md_data(vpninfo->esp_out.pkt_hmac->md_ctx);
+	SHA1_Update(sha, (void *)&pkt->esp, stitched * BLK);
+	printf("rehash %d bytes at %p, next %p\n", stitched * BLK, &pkt->esp,
+	       ((void *)&pkt->esp) + (stitched * BLK));
+#endif
+
+	/* Now encrypt anything remaining */
+	stitched *= BLK;
+	stitched += PRECBC; /* We pre-encrypted one block for EtM */
+	if (crypt_len > stitched)
+		aesni_cbc_encrypt(pkt->data + stitched, pkt->data + stitched,
+				  crypt_len - stitched, ak, (unsigned char *)&vpninfo->esp_out.iv, 1);
+
+	/* And now fold in the final part of the HMAC, which is two blocks plus the ESP header behind */
+	stitched -= PRECBC + sizeof(pkt->esp);
+	HMAC_Update(vpninfo->esp_out.hmac, (void *)&pkt->data[stitched], crypt_len - stitched);
+	//	printf("hashed %d more bytes at %p\n", crypt_len - stitched, &pkt->data[stitched]);
+	//	printf("crypt_len %d, stitched %d, esp %p, data %p\n", crypt_len, stitched, &pkt->esp, &pkt->data);
+	HMAC_Final(vpninfo->esp_out.hmac, pkt->data + crypt_len, &hmac_len);
+
+	return sizeof(pkt->esp) + crypt_len + 12;
+}
+#endif

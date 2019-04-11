@@ -1,5 +1,6 @@
 AC_INIT(openconnect, 8.02)
 AC_CONFIG_HEADERS([config.h])
+AM_PROG_AS
 
 PKG_PROG_PKG_CONFIG
 AC_LANG_C

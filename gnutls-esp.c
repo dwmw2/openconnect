@@ -49,7 +49,7 @@ static int init_esp_ciphers(struct openconnect_info *vpninfo, struct esp *esp,
 
 	enc_key.size = gnutls_cipher_get_key_size(encalg);
 	enc_key.data = esp->enc_key;
-
+	printf("key size %d, hmac size %d\n", enc_key.size, gnutls_hmac_get_len(macalg));
 	err = gnutls_cipher_init(&esp->cipher, encalg, &enc_key, NULL);
 	if (err) {
 		vpn_progress(vpninfo, PRG_ERR,
@@ -66,7 +66,18 @@ static int init_esp_ciphers(struct openconnect_info *vpninfo, struct esp *esp,
 			     _("Failed to initialize ESP HMAC: %s\n"),
 			     gnutls_strerror(err));
 		destroy_esp_ciphers(esp);
+		return -EIO;
 	}
+
+	err = gnutls_rnd(GNUTLS_RND_NONCE, esp->iv, sizeof(esp->iv));
+	if (err) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to generate ESP IV: %s\n"),
+			     gnutls_strerror(err));
+		destroy_esp_ciphers(esp);
+		return -EIO;
+	}
+	gnutls_cipher_set_iv(vpninfo->esp_out.cipher, esp->iv, sizeof(esp->iv));
 	esp->seq = 0;
 	esp->seq_backlog = 0;
 	return 0;
@@ -79,8 +90,8 @@ int setup_esp_keys(struct openconnect_info *vpninfo, int new_keys)
 	gnutls_cipher_algorithm_t encalg;
 	int ret;
 
-	if (vpninfo->dtls_state == DTLS_DISABLED)
-		return -EOPNOTSUPP;
+	if (vpninfo->dtls_state == DTLS_DISABLED) {printf("not enabled\n");
+		return -EOPNOTSUPP;}
 	if (!vpninfo->dtls_addr) {printf("no addr\n");
 		return -EINVAL;}
 
@@ -106,7 +117,6 @@ int setup_esp_keys(struct openconnect_info *vpninfo, int new_keys)
 		return -EINVAL;
 	}
 
-	printf("enc %d mac %d\n", encalg, macalg);
 	if (new_keys) {
 		vpninfo->old_esp_maxseq = vpninfo->esp_in[vpninfo->current_esp_in].seq + 32;
 		vpninfo->current_esp_in ^= 1;
@@ -186,13 +196,9 @@ int encrypt_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt)
 	/* This gets much more fun if the IV is variable-length */
 	pkt->esp.spi = vpninfo->esp_out.spi;
 	pkt->esp.seq = htonl(vpninfo->esp_out.seq++);
-	err = gnutls_rnd(GNUTLS_RND_NONCE, pkt->esp.iv, sizeof(pkt->esp.iv));
-	if (err) {
-		vpn_progress(vpninfo, PRG_ERR,
-			     _("Failed to generate ESP packet IV: %s\n"),
-			     gnutls_strerror(err));
-		return -EIO;
-	}
+
+	memcpy(pkt->esp.iv, vpninfo->esp_out.iv, sizeof(pkt->esp.iv));
+//	gnutls_cipher_set_iv(vpninfo->esp_out.cipher, pkt->esp.iv, sizeof(pkt->esp.iv));
 
 	padlen = blksize - 1 - ((pkt->len + 1) % blksize);
 	for (i=0; i<padlen; i++)
@@ -200,7 +206,6 @@ int encrypt_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt)
 	pkt->data[pkt->len + padlen] = padlen;
 	pkt->data[pkt->len + padlen + 1] = 0x04; /* Legacy IP */
 
-	gnutls_cipher_set_iv(vpninfo->esp_out.cipher, pkt->esp.iv, sizeof(pkt->esp.iv));
 	err = gnutls_cipher_encrypt(vpninfo->esp_out.cipher, pkt->data, pkt->len + padlen + 2);
 	if (err) {
 		vpn_progress(vpninfo, PRG_ERR,
@@ -208,6 +213,8 @@ int encrypt_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt)
 			     gnutls_strerror(err));
 		return -EIO;
 	}
+	/* Copy the IV (last cipherblock) */
+	memcpy(vpninfo->esp_out.iv, pkt->data + pkt->len + padlen - 14, 16);
 
 	err = gnutls_hmac(vpninfo->esp_out.hmac, &pkt->esp, sizeof(pkt->esp) + pkt->len + padlen + 2);
 	if (err) {

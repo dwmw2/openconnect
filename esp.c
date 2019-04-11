@@ -195,7 +195,8 @@ int esp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 		}
 		vpninfo->dtls_times.last_rx = time(NULL);
 
-		if (vpninfo->proto->udp_catch_probe) {
+		if (vpninfo->proto->udp_catch_probe &&
+		    vpninfo->dtls_state == DTLS_SLEEPING) {
 			if (vpninfo->proto->udp_catch_probe(vpninfo, pkt)) {
 				if (vpninfo->dtls_state == DTLS_SLEEPING) {
 					vpn_progress(vpninfo, PRG_INFO,
@@ -311,7 +312,7 @@ int esp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 			unmonitor_write_fd(vpninfo, dtls);
 			vpninfo->deflate_pkt = NULL;
 		}
-		free(this);
+		pkt_free(vpninfo, this);
 		work_done = 1;
 	}
 
