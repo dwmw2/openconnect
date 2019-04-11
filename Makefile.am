@@ -42,6 +42,9 @@ lib_srcs_yubikey = yubikey.c
 lib_srcs_stoken = stoken.c
 lib_srcs_esp = esp.c esp-seqno.c
 lib_srcs_dtls = dtls.c
+if OPENCONNECT_AESNI
+lib_srcs_esp += aesni-sha1-x86_64.s aesni-x86_64.s sha1-x86_64.s
+endif
 
 POTFILES = $(openconnect_SOURCES) $(lib_srcs_cisco) $(lib_srcs_juniper) $(lib_srcs_globalprotect) \
 	   gnutls-esp.c gnutls-dtls.c openssl-esp.c openssl-dtls.c \
@@ -138,6 +141,9 @@ pkglibexec_SCRIPTS = trojans/csd-post.sh trojans/csd-wrapper.sh trojans/hiprepor
 
 # main.c includes version.c
 openconnect-main.$(OBJEXT): version.c
+
+%.s: aesni/%.pl
+	$(PERL) $< > $@
 
 version.c: $(library_srcs) $(lib_openssl_srcs) $(lib_gnutls_srcs) \
 	   $(openconnect_SOURCES) Makefile.am configure.ac \

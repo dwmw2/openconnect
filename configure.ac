@@ -3,6 +3,7 @@ AC_CONFIG_HEADERS([config.h])
 
 PKG_PROG_PKG_CONFIG
 AC_LANG_C
+AM_PROG_AS
 AC_CANONICAL_HOST
 AM_MAINTAINER_MODE([enable])
 AM_INIT_AUTOMAKE([foreign tar-ustar])
@@ -225,6 +226,16 @@ if test "$ac_cv_func_nl_langinfo" = "yes"; then
     fi
 fi
 AM_CONDITIONAL(OPENCONNECT_ICONV, [test "$am_cv_func_iconv" = "yes"])
+
+aesni=no
+if test "$host_cpu" = "x86_64"; then
+   AC_PATH_PROG(PERL, perl)
+   if test "$PERL" != ""; then
+      AC_DEFINE(AESNI_ASM, 1, [Have AES-NI assembler])
+      aesni=yes
+   fi
+fi
+AM_CONDITIONAL(OPENCONNECT_AESNI, [test "$aesni" = "yes"])
 
 AC_ARG_ENABLE([nls],
 	AS_HELP_STRING([--disable-nls], [Do not use Native Language Support]),
