@@ -738,6 +738,9 @@ static void handle_signal(int sig)
 	default:
 		cmd = OC_CMD_PAUSE;
 		break;
+	case SIGUSR1:
+		cmd = OC_CMD_STATS;
+		break;
 	}
 
 	if (write(sig_cmd_fd, &cmd, 1) < 0) {
@@ -1092,6 +1095,12 @@ static void get_uids(const char *config_arg, uid_t *uid, gid_t *gid)
 }
 #endif
 
+static void dump_stats(void *p, const struct oc_stats *stats)
+{
+	printf("TX pkts: %ld bytes %ld\n", stats->tx_pkts, stats->tx_bytes);
+	printf("RX pkts: %ld bytes %ld\n", stats->rx_pkts, stats->rx_bytes);
+}
+
 int main(int argc, char **argv)
 {
 	struct openconnect_info *vpninfo;
@@ -1158,6 +1167,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
+	openconnect_set_stats_handler(vpninfo, dump_stats);
 	vpninfo->cbdata = vpninfo;
 #ifdef _WIN32
 	set_default_vpncscript();
@@ -1548,6 +1558,7 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGHUP, &sa, NULL);
 	sigaction(SIGUSR2, &sa, NULL);
+	sigaction(SIGUSR1, &sa, NULL);
 #endif /* !_WIN32 */
 
 	sig_cmd_fd = openconnect_setup_cmd_pipe(vpninfo);
