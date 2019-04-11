@@ -9,7 +9,7 @@ aesni_cbc_sha1_enc:
 	movl	OPENSSL_ia32cap_P+0(%rip),%r10d
 	movq	OPENSSL_ia32cap_P+4(%rip),%r11
 	btq	$61,%r11
-	jc	aesni_cbc_sha1_enc_ssse3
+	jc	aesni_cbc_sha1_enc_avx
 	andl	$268435456,%r11d
 	andl	$1073741824,%r10d
 	orl	%r11d,%r10d
