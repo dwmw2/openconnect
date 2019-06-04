@@ -46,6 +46,9 @@
 #define VENDOR_JUNIPER 0xa4c
 #define VENDOR_JUNIPER2 0x583
 
+#define AVP_VENDOR 0x80
+#define AVP_MANDATORY 0x40
+
 #define EAP_REQUEST 1
 #define EAP_RESPONSE 2
 #define EAP_SUCCESS 3
@@ -131,7 +134,7 @@ static void buf_fill_eap_len(struct oc_text_buf *buf)
 		store_be16(buf->data + 0x16, buf->pos - 0x14);
 }
 
-static void buf_append_elem(struct oc_text_buf *buf, uint32_t type, const void *bytes, int len)
+static void buf_append_avp(struct oc_text_buf *buf, uint32_t type, const void *bytes, int len)
 {
 	buf_append_be32(buf, type);
 	buf_append_be16(buf, 0x8000);
@@ -144,17 +147,17 @@ static void buf_append_elem(struct oc_text_buf *buf, uint32_t type, const void *
 	}
 }
 
-static void buf_append_elem_be32(struct oc_text_buf *buf, uint32_t type, uint32_t val)
+static void buf_append_avp_be32(struct oc_text_buf *buf, uint32_t type, uint32_t val)
 {
 	uint32_t val_be;
 
 	store_be32(&val_be, val);
-	buf_append_elem(buf, type, &val_be, 4);
+	buf_append_avp(buf, type, &val_be, 4);
 }
 
-static void buf_append_elem_string(struct oc_text_buf *buf, uint32_t type, const char *str)
+static void buf_append_avp_string(struct oc_text_buf *buf, uint32_t type, const char *str)
 {
-	buf_append_elem(buf, type, str, strlen(str));
+	buf_append_avp(buf, type, str, strlen(str));
 }
 #if 0
 
@@ -499,34 +502,60 @@ static int send_ift_packet(struct openconnect_info *vpninfo, struct oc_text_buf 
 	return 0;
 }
 
-static int process_packet(struct openconnect_info *vpninfo, unsigned char *p, int l)
+static void process_avp(struct openconnect_info *vpninfo, uint8_t flags,
+		       uint32_t vendor, uint32_t code, void *p, int len)
 {
-	uint32_t type;
-	uint16_t flags; /* ? */
-	uint16_t elem_len;
+	if (flags & AVP_VENDOR)
+		vpn_progress(vpninfo, PRG_TRACE, _("AVP 0x%x/0x%x:\n"), vendor, code);
+	else
+		vpn_progress(vpninfo, PRG_TRACE, _("AVP %d:\n"), code);
+	dump_buf_hex(vpninfo, PRG_TRACE, ' ', p, len);
+}
+
+/* RFC5281 §10 */
+static int process_avps(struct openconnect_info *vpninfo, void *_p, int l)
+{
+	unsigned char *p = _p;
+	uint32_t avp_code;
+	uint32_t avp_len;
+	uint32_t avp_vendor;
+	uint8_t flags;
 
 	while (l) {
-		if (l < 12) {
+		if (l < 8) {
 		bad_len:
 			vpn_progress(vpninfo, PRG_ERR,
-				     _("Failed to parse Pulse packet; invalid length\n"));
+				     _("Failed to parse AVP in Pulse packet; invalid length\n"));
 			return -EINVAL;
 		}
-		elem_len = load_be16(p + 6);
-		if (elem_len > l || elem_len < 12)
+		avp_code = load_be32(p);
+		avp_len = load_be32(p + 4) & 0xffffff;
+		flags = p[4];
+
+		if (avp_len > l || avp_len < 8)
 			goto bad_len;
-		type = load_be32(p);
-		flags = load_be16(p + 4);
-		if (flags == 0x8000) {
-			uint32_t vendor = load_be32(p + 8);
-			vpn_progress(vpninfo, PRG_TRACE, _("Info 0x%x/0x%x:\n"), vendor, type);
-			dump_buf_hex(vpninfo, PRG_TRACE, ' ', p + 12, elem_len - 12);
+		if (flags & AVP_VENDOR) {
+			if (l < 12 || avp_len < 12)
+				goto bad_len;
+			avp_vendor = load_be32(p + 8);
+			p += 12;
+			l -= 12;
+			avp_len -= 12;
+		} else {
+			if (avp_len < 8)
+				goto bad_len;
+			avp_vendor = 0;
+			p += 8;
+			l -= 8;
+			avp_len -= 8;
 		}
-		elem_len = (elem_len + 3) & ~3;
-		if (elem_len > l)
+
+		process_avp(vpninfo, flags, avp_vendor, avp_code, p, avp_len);
+		avp_len = (avp_len + 3) & ~3;
+		if (avp_len > l)
 			return 0;
-		p += elem_len;
-		l -= elem_len;
+		p += avp_len;
+		l -= avp_len;
 	}
 	return 0;
 }
@@ -693,7 +722,7 @@ int pulse_connect(struct openconnect_info *vpninfo)
 
 	/* OK, we have an expanded Juniper/1 frame and we know the EAP length matches
 	 * the actual length of what we read, as does the IF-T/TLS header. */
-	ret = process_packet(vpninfo, bytes + 0x20, ret - 0x20);
+	ret = process_avps(vpninfo, bytes + 0x20, ret - 0x20);
 	if (ret)
 		goto out;
 
@@ -701,17 +730,18 @@ int pulse_connect(struct openconnect_info *vpninfo)
 	buf_truncate(reqbuf);
 	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_SASL_RESULT);
 	buf_append_eap_hdr(reqbuf, EAP_RESPONSE, 1, EAP_TYPE_EXPANDED, 1);
-	buf_append_elem_be32(reqbuf, 0xd49, 3);
-	buf_append_elem_be32(reqbuf, 0xd61, 0);
-	buf_append_elem_string(reqbuf, 0xd53, "Windows");
-	buf_append_elem_string(reqbuf, 0xd70, "Junos-Pulse/8.0.8.52215 (Windows 7)");
-	buf_append_elem(reqbuf, 0xd63, "\xc5\xc9\xb2\x3b\x8e\xc1\x4e\x92\xbd\xed\x75\x1b\x36\x16\xb3\xc5", 16);
-	buf_append_elem(reqbuf, 0xd64, "\x41\xc2\xb5\x23\xa9\xff\x4b\x48\xb7\x51\x56\x43\x7f\x15\xc2\xd7", 16);
-	buf_append_elem_string(reqbuf, 0xd5f, "en-GB");
-	buf_append_elem(reqbuf, 0xd6c, "\x52\x54\x00\x7c\x9b\x4c", 6);
-	buf_append_elem_string(reqbuf, 0xd53, vpninfo->cookie);
+	buf_append_avp_be32(reqbuf, 0xd49, 2);
+	buf_append_avp_be32(reqbuf, 0xd61, 0);
+	buf_append_avp_string(reqbuf, 0xd53, "Windows");
+	buf_append_avp_string(reqbuf, 0xd70, "Pulse-Secure/9.0.2.1151 (Windows 10) Pulse/9.0.2.1151");
+	buf_append_avp(reqbuf, 0xd63, "\x66\x41\x88\xd9\x5d\x07\x4c\xb8\x9a\x63\xcb\xdf\x62\xe8\x14\xef", 16);
+	buf_append_avp(reqbuf, 0xd64, "\x13\x34\x29\x1f\x13\x92\xd5\x42\xa3\x3d\xda\x96\x28\x2b\x19\xea", 16);
+	buf_append_avp_string(reqbuf, 0xd5f, "en-US");
+	buf_append_avp(reqbuf, 0xd6c, "\x52\x54\x00\xcf\x8a\x80", 6);
+	buf_append_avp_be32(reqbuf, 0xd84, 1);
+	//	buf_append_avp_string(reqbuf, 0xd53, vpninfo->cookie);
 	buf_fill_eap_len(reqbuf);
-	process_packet(vpninfo, reqbuf->data + 0x20, reqbuf->pos - 0x20);
+	process_avps(vpninfo, reqbuf->data + 0x20, reqbuf->pos - 0x20);
 	ret = send_ift_packet(vpninfo, reqbuf);
 	if (ret)
 		goto out;
