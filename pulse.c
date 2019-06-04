@@ -91,8 +91,8 @@ static void buf_append_ift_hdr(struct oc_text_buf *buf, uint32_t vendor, uint32_
 {
 	uint32_t b[4];
 
+	b[2] = 0;
 	b[3] = 0;
-	b[4] = 0;
 	store_be32(&b[0], vendor);
 	store_be32(&b[1], type);
 	buf_append_bytes(buf, b, 16);
@@ -562,7 +562,7 @@ static int process_avps(struct openconnect_info *vpninfo, void *_p, int l)
 
 int pulse_connect(struct openconnect_info *vpninfo)
 {
-	int ret, len, kmp, kmplen, group, check_len;
+	int ret;
 	struct oc_text_buf *reqbuf;
 	unsigned char bytes[16384];
 
@@ -577,7 +577,6 @@ int pulse_connect(struct openconnect_info *vpninfo)
 
 	buf_append(reqbuf, "GET / HTTP/1.1\r\n");
 	http_common_headers(vpninfo, reqbuf);
-
 	buf_append(reqbuf, "Content-Type: EAP\r\n");
 	buf_append(reqbuf, "Upgrade: IF-T/TLS 1.0\r\n");
 	buf_append(reqbuf, "Content-Length: 0\r\n");
@@ -611,8 +610,8 @@ int pulse_connect(struct openconnect_info *vpninfo)
 	/* IF-T version request. */
 	buf_truncate(reqbuf);
 	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_VERSION_REQUEST);
-	/* min, max, preferred version all 0x01 */
-	buf_append_be32(reqbuf, 0x00010101);
+	/* min=1, max=2, preferred version=2 */
+	buf_append_be32(reqbuf, 0x00010202);
 	ret = send_ift_packet(vpninfo, reqbuf);
 	if (ret)
 		goto out;
@@ -729,24 +728,52 @@ int pulse_connect(struct openconnect_info *vpninfo)
 	/* Present the auth cookie */
 	buf_truncate(reqbuf);
 	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_SASL_RESULT);
-	buf_append_eap_hdr(reqbuf, EAP_RESPONSE, 1, EAP_TYPE_EXPANDED, 1);
-	buf_append_avp_be32(reqbuf, 0xd49, 2);
-	buf_append_avp_be32(reqbuf, 0xd61, 0);
-	buf_append_avp_string(reqbuf, 0xd53, "Windows");
-	buf_append_avp_string(reqbuf, 0xd70, "Pulse-Secure/9.0.2.1151 (Windows 10) Pulse/9.0.2.1151");
-	buf_append_avp(reqbuf, 0xd63, "\x66\x41\x88\xd9\x5d\x07\x4c\xb8\x9a\x63\xcb\xdf\x62\xe8\x14\xef", 16);
-	buf_append_avp(reqbuf, 0xd64, "\x13\x34\x29\x1f\x13\x92\xd5\x42\xa3\x3d\xda\x96\x28\x2b\x19\xea", 16);
-	buf_append_avp_string(reqbuf, 0xd5f, "en-US");
-	buf_append_avp(reqbuf, 0xd6c, "\x52\x54\x00\xcf\x8a\x80", 6);
-	buf_append_avp_be32(reqbuf, 0xd84, 1);
-	//	buf_append_avp_string(reqbuf, 0xd53, vpninfo->cookie);
+	buf_append_eap_hdr(reqbuf, EAP_RESPONSE, bytes[0x15], EAP_TYPE_EXPANDED, 1);
+	//buf_append_avp_string(reqbuf, 0xd5e, vpninfo->platname);
+	buf_append_avp_string(reqbuf, 0xd70, vpninfo->useragent);
+	buf_append_avp_string(reqbuf, 0xd53, vpninfo->cookie);
 	buf_fill_eap_len(reqbuf);
-	process_avps(vpninfo, reqbuf->data + 0x20, reqbuf->pos - 0x20);
 	ret = send_ift_packet(vpninfo, reqbuf);
 	if (ret)
 		goto out;
 
-	while (1) {
+
+	/* Await start of auth negotiations */
+	ret = vpninfo->ssl_read(vpninfo, (void *)bytes, sizeof(bytes));
+	if (ret < 0)
+		goto out;
+	vpn_progress(vpninfo, PRG_TRACE,
+		     _("Read %d bytes of SSL record\n"), ret);
+	dump_buf_hex(vpninfo, PRG_TRACE, '<', (void *)bytes, ret);
+
+	if (ret < 0x19 || (load_be32(bytes) & 0xffffff) != VENDOR_TCG ||
+	    load_be32(bytes + 4) != IFT_SASL_DATA ||
+	    load_be32(bytes + 8) < 0x14 ||
+	    load_be32(bytes + 0x10) != JUNIPER_1 ||
+	    bytes[0x14] != EAP_REQUEST ||
+	    load_be16(bytes + 0x16) != ret - 0x14)
+		goto bad_eap;
+
+	if (ret < 0x20 || load_be32(bytes + 0x18) != EXPANDED_JUNIPER ||
+	    load_be32(bytes + 0x1c) != 1)
+		goto bad_eap;
+
+	// XXX: Check for validity
+	ret = process_avps(vpninfo, bytes + 0x20, ret - 0x20);
+	if (ret)
+		goto out;
+
+
+	/* Present the auth cookie */
+	buf_truncate(reqbuf);
+	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_SASL_RESULT);
+	buf_append_eap_hdr(reqbuf, EAP_RESPONSE, bytes[0x15], EAP_TYPE_EXPANDED, 1);
+	buf_fill_eap_len(reqbuf);
+	ret = send_ift_packet(vpninfo, reqbuf);
+	if (ret)
+		goto out;
+
+	while (0) {
 		ret = vpninfo->ssl_read(vpninfo, (void *)bytes, 16384);
 		if (ret < 0)
 			goto out;
@@ -758,7 +785,7 @@ int pulse_connect(struct openconnect_info *vpninfo)
 			printf("%s", bytes + 16);
 		}
 	}
-	ret = -1;
+	ret = 0;
  out:
 	if (ret)
 		openconnect_close_https(vpninfo, 0);
@@ -771,7 +798,7 @@ int pulse_connect(struct openconnect_info *vpninfo)
 
 	free(vpninfo->cstp_pkt);
 	vpninfo->cstp_pkt = NULL;
-
+	vpninfo->ip_info.mtu= 1400;
 	return ret;
 }
 
@@ -781,7 +808,6 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 	int ret;
 	int work_done = 0;
 
-#if 0
 	if (vpninfo->ssl_fd == -1)
 		goto do_reconnect;
 
@@ -792,166 +818,58 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 	   and add POLLOUT. As it is, though, it'll just chew CPU time in that
 	   fairly unlikely situation, until the write backlog clears. */
 	while (readable) {
-		int len, kmp, kmplen, iplen;
 		/* Some servers send us packets that are larger than
-		   negitiated MTU. We reserve some estra space to
+		   negotiated MTU. We reserve some extra space to
 		   handle that */
-		int receive_mtu = MAX(16384, vpninfo->ip_info.mtu);
+		int receive_mtu = MAX(16384, vpninfo->deflate_pkt_size ? : vpninfo->ip_info.mtu);
+		int len, payload_len;
 
-		len = receive_mtu + vpninfo->pkt_trailer;
 		if (!vpninfo->cstp_pkt) {
-			vpninfo->cstp_pkt = malloc(sizeof(struct pkt) + len);
+			vpninfo->cstp_pkt = malloc(sizeof(struct pkt) + receive_mtu);
 			if (!vpninfo->cstp_pkt) {
 				vpn_progress(vpninfo, PRG_ERR, _("Allocation failed\n"));
 				break;
 			}
-			vpninfo->cstp_pkt->len = 0;
 		}
 
-		/*
-		 * This protocol is horrid. There are encapsulations within
-		 * encapsulations within encapsulations. Some of them entirely
-		 * gratuitous.
-		 *
-		 * First there's the SSL records which are a natural part of
-		 * using TLS as a transport. They appear to make no use of the
-		 * packetisation which these provide.
-		 *
-		 * Then within the TLS data stream there are "records" preceded
-		 * by a 16-bit little-endian length. It's not clear what these
-		 * records represent; they appear to be entirely gratuitous and
-		 * just need to be discarded. A record boundary sometimes falls
-		 * right in the middle of a data packet; there's no apparent
-		 * logic to it.
-		 *
-		 * Then there are the KMP packets themselves, each of which has
-		 * a length field of its own. There can be multiple KMP packets
-		 * in each of the above-mention "records", and as noted there
-		 * even be *partial* KMP packets in each record.
-		 *
-		 * Finally, a KMP data packet may actually contain multiple IP
-		 * packets, which need to be split apart by using the length
-		 * field in the IP header. This is Legacy IP only, never IPv6
-		 * for the Network Connect protocol.
-		 */
-
-		/* Until we pass it up the stack, we use cstp_pkt->len to show
-		 * the amount of data received *including* the KMP header. */
-		len = pulse_record_read(vpninfo,
-				       vpninfo->cstp_pkt->pulse.kmp + vpninfo->cstp_pkt->len,
-				       receive_mtu + 20 - vpninfo->cstp_pkt->len);
+		len = ssl_nonblock_read(vpninfo, &vpninfo->cstp_pkt->pulse.vendor, receive_mtu + 16);
 		if (!len)
 			break;
-		else if (len < 0) {
-			if (vpninfo->quit_reason)
-				return len;
+		if (len < 0)
 			goto do_reconnect;
+		if (len < 16) {
+			vpn_progress(vpninfo, PRG_ERR, _("Short packet received (%d bytes)\n"), len);
+			vpninfo->quit_reason = "Short packet received";
+			return 1;
 		}
-		vpninfo->cstp_pkt->len += len;
+
+		if (load_be32(&vpninfo->cstp_pkt->pulse.vendor) != VENDOR_JUNIPER ||
+		    load_be32(&vpninfo->cstp_pkt->pulse.len) != len)
+			goto unknown_pkt;
+
 		vpninfo->ssl_times.last_rx = time(NULL);
-		if (vpninfo->cstp_pkt->len < 20)
-			continue;
 
-	next_kmp:
-		/* Now we have a KMP header. It might already have been there */
-		kmp = load_be16(vpninfo->cstp_pkt->pulse.kmp + 6);
-		kmplen = load_be16(vpninfo->cstp_pkt->pulse.kmp + 18);
-		if (len == vpninfo->cstp_pkt->len)
-			vpn_progress(vpninfo, PRG_DEBUG, _("Incoming KMP message %d of size %d (got %d)\n"),
-				     kmp, kmplen, vpninfo->cstp_pkt->len - 20);
-		else
-			vpn_progress(vpninfo, PRG_DEBUG, _("Continuing to process KMP message %d now size %d (got %d)\n"),
-				     kmp, kmplen, vpninfo->cstp_pkt->len - 20);
-
-		switch (kmp) {
-		case 300:
-		next_ip:
-			/* Need at least 6 bytes of payload to check the IP packet length */
-			if (vpninfo->cstp_pkt->len < 26)
-				continue;
-			switch(vpninfo->cstp_pkt->data[0] >> 4) {
-			case 4:
-				iplen = load_be16(vpninfo->cstp_pkt->data + 2);
-				break;
-			case 6:
-				iplen = load_be16(vpninfo->cstp_pkt->data + 4) + 40;
-				break;
-			default:
-			badiplen:
-				vpn_progress(vpninfo, PRG_ERR,
-					     _("Unrecognised data packet\n"));
-				goto unknown_pkt;
-			}
-
-			if (!iplen || iplen > receive_mtu || iplen > kmplen)
-				goto badiplen;
-
-			if (iplen > vpninfo->cstp_pkt->len - 20)
-				continue;
-
-			work_done = 1;
+		switch(load_be32(&vpninfo->cstp_pkt->pulse.type)) {
+		case 4:
+			payload_len = len - 16;
 			vpn_progress(vpninfo, PRG_TRACE,
-				     _("Received uncompressed data packet of %d bytes\n"),
-				     iplen);
-
-			/* If there's nothing after the IP packet, and it's the last (or
-			 * only) packet in this KMP300 so we don't need to keep the KMP
-			 * header either, then just queue it. */
-			if (iplen == kmplen && iplen == vpninfo->cstp_pkt->len - 20) {
-				vpninfo->cstp_pkt->len = iplen;
-				queue_packet(&vpninfo->incoming_queue, vpninfo->cstp_pkt);
-				vpninfo->cstp_pkt = NULL;
-				continue;
-			}
-
-			/* OK, we have a whole packet, and we have stuff after it */
-			queue_new_packet(&vpninfo->incoming_queue, vpninfo->cstp_pkt->data, iplen);
-			kmplen -= iplen;
-			if (kmplen) {
-				/* Still data packets to come in this KMP300 */
-				store_be16(vpninfo->cstp_pkt->pulse.kmp + 18, kmplen);
-				vpninfo->cstp_pkt->len -= iplen;
-				if (vpninfo->cstp_pkt->len > 20)
-					memmove(vpninfo->cstp_pkt->data,
-						vpninfo->cstp_pkt->data + iplen,
-						vpninfo->cstp_pkt->len - 20);
-				goto next_ip;
-			}
-			/* We have depleted the KMP300, and there are more bytes from
-			 * the next KMP message in the buffer. Move it up and process it */
-			memmove(vpninfo->cstp_pkt->pulse.kmp,
-				vpninfo->cstp_pkt->data + iplen,
-				vpninfo->cstp_pkt->len - iplen - 20);
-			vpninfo->cstp_pkt->len -= (iplen + 20);
-			goto next_kmp;
-
-		case 302:
-			/* Should never happen; if it does we'll have to cope */
-			if (kmplen > receive_mtu)
-				goto unknown_pkt;
-			/* Probably never happens. We need it in its own record.
-			 * If I fix pulse_receive_espkeys() not to reuse cstp_pkt
-			 * we can stop doing this. */
-			if (vpninfo->cstp_pkt->len != kmplen + 20)
-				goto unknown_pkt;
-			ret = pulse_receive_espkeys(vpninfo, kmplen);
+				     _("Received data packet of %d bytes\n"),
+				     payload_len);
+			vpninfo->cstp_pkt->len = payload_len;
+			queue_packet(&vpninfo->incoming_queue, vpninfo->cstp_pkt);
+			vpninfo->cstp_pkt = NULL;
 			work_done = 1;
-			break;
+			continue;
 
 		default:
 		unknown_pkt:
 			vpn_progress(vpninfo, PRG_ERR,
-				     _("Unknown KMP message %d of size %d:\n"), kmp, kmplen);
-			dump_buf_hex(vpninfo, PRG_ERR, '<', vpninfo->cstp_pkt->pulse.kmp,
-				     vpninfo->cstp_pkt->len);
-			if (kmplen + 20 != vpninfo->cstp_pkt->len)
-				vpn_progress(vpninfo, PRG_DEBUG,
-					     _(".... + %d more bytes unreceived\n"),
-					     kmplen + 20 - vpninfo->cstp_pkt->len);
-			vpninfo->quit_reason = "Unknown packet received";
-			return 1;
+				     _("Unknown Pulse packet\n"));
+			dump_buf_hex(vpninfo, PRG_TRACE, '<', (void *)&vpninfo->cstp_pkt->pulse.vendor, len);
+			continue;
 		}
 	}
+
 
 	/* If SSL_write() fails we are expected to try again. With exactly
 	   the same data, at exactly the same location. So we keep the
@@ -961,16 +879,17 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 		vpninfo->ssl_times.last_tx = time(NULL);
 		unmonitor_write_fd(vpninfo, ssl);
 
+
 		vpn_progress(vpninfo, PRG_TRACE, _("Packet outgoing:\n"));
 		dump_buf_hex(vpninfo, PRG_TRACE, '>',
-			     vpninfo->current_ssl_pkt->pulse.rec,
-			     vpninfo->current_ssl_pkt->len + 22);
+			     (void *)&vpninfo->current_ssl_pkt->pulse.vendor,
+			     vpninfo->current_ssl_pkt->len + 16);
 
 		ret = ssl_nonblock_write(vpninfo,
-					 vpninfo->current_ssl_pkt->pulse.rec,
-					 vpninfo->current_ssl_pkt->len + 22);
+					 &vpninfo->current_ssl_pkt->pulse.vendor,
+					 vpninfo->current_ssl_pkt->len + 16);
 		if (ret < 0) {
-		do_reconnect:
+			do_reconnect:
 			/* XXX: Do we have to do this or can we leave it open?
 			 * Perhaps we could even reconnect asynchronously while
 			 * the ESP is still running? */
@@ -980,13 +899,13 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 			ret = ssl_reconnect(vpninfo);
 			if (ret) {
 				vpn_progress(vpninfo, PRG_ERR, _("Reconnect failed\n"));
-				vpninfo->quit_reason = "pulse reconnect failed";
+				vpninfo->quit_reason = "Pulse reconnect failed";
 				return ret;
 			}
 			vpninfo->dtls_need_reconnect = 1;
 			return 1;
 		} else if (!ret) {
-#if 0 /* Not for Juniper yet */
+#if 0 /* Not for Pulse yet */
 			/* -EAGAIN: ssl_nonblock_write() will have added the SSL
 			   fd to ->select_wfds if appropriate, so we can just
 			   return and wait. Unless it's been stalled for so long
@@ -1007,31 +926,24 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 #endif
 		}
 
-		if (ret != vpninfo->current_ssl_pkt->len + 22) {
+		if (ret != vpninfo->current_ssl_pkt->len + 16) {
 			vpn_progress(vpninfo, PRG_ERR,
 				     _("SSL wrote too few bytes! Asked for %d, sent %d\n"),
-				     vpninfo->current_ssl_pkt->len + 22, ret);
+				     vpninfo->current_ssl_pkt->len + 8, ret);
 			vpninfo->quit_reason = "Internal error";
 			return 1;
 		}
 		/* Don't free the 'special' packets */
 		if (vpninfo->current_ssl_pkt == vpninfo->deflate_pkt) {
 			free(vpninfo->pending_deflated_pkt);
-		} else if (vpninfo->current_ssl_pkt == &esp_enable_pkt) {
-			/* Only set the ESP state to connected and actually start
-			   sending packets on it once the enable message has been
-			   *sent* over the TCP channel. */
-			vpn_progress(vpninfo, PRG_TRACE,
-				     _("Sent ESP enable control packet\n"));
-			vpninfo->dtls_state = DTLS_CONNECTED;
-			work_done = 1;
-		} else {
+			vpninfo->pending_deflated_pkt = NULL;
+		} else
 			free(vpninfo->current_ssl_pkt);
-		}
+
 		vpninfo->current_ssl_pkt = NULL;
 	}
 
-#if 0 /* Not understood for Juniper yet */
+#if 0 /* Not understood for Pulse yet */
 	if (vpninfo->owe_ssl_dpd_response) {
 		vpninfo->owe_ssl_dpd_response = 0;
 		vpninfo->current_ssl_pkt = (struct pkt *)&dpd_resp_pkt;
@@ -1062,6 +974,7 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 	peer_dead:
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("CSTP Dead Peer Detection detected dead peer!\n"));
+		goto do_reconnect;
 	do_reconnect:
 		ret = cstp_reconnect(vpninfo);
 		if (ret) {
@@ -1089,7 +1002,8 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 	case KA_KEEPALIVE:
 		/* No need to send an explicit keepalive
 		   if we have real data to send */
-		if (vpninfo->dtls_state != DTLS_CONNECTED && vpninfo->outgoing_queue)
+		if (vpninfo->dtls_state != DTLS_CONNECTED &&
+		    vpninfo->outgoing_queue.head)
 			break;
 
 		vpn_progress(vpninfo, PRG_DEBUG, _("Send CSTP Keepalive\n"));
@@ -1101,47 +1015,30 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 		;
 	}
 #endif
-	/* Queue the ESP enable message. We will start sending packets
-	 * via ESP once the enable message has been *sent* over the
-	 * TCP channel. Assign it directly to current_ssl_pkt so that
-	 * we can use it in-place and match against it above. */
-	if (vpninfo->dtls_state == DTLS_CONNECTING) {
-		vpninfo->current_ssl_pkt = (struct pkt *)&esp_enable_pkt;
-		goto handle_outgoing;
-	}
-
-	vpninfo->current_ssl_pkt = dequeue_packet(&vpninfo->pulse_control_queue);
-	if (vpninfo->current_ssl_pkt)
-		goto handle_outgoing;
-
 	/* Service outgoing packet queue, if no DTLS */
 	while (vpninfo->dtls_state != DTLS_CONNECTED &&
 	       (vpninfo->current_ssl_pkt = dequeue_packet(&vpninfo->outgoing_queue))) {
 		struct pkt *this = vpninfo->current_ssl_pkt;
 
-		/* Little-endian overall record length */
-		store_le16(this->pulse.rec, (this->len + 20));
-		memcpy(this->pulse.kmp, data_hdr, 18);
-		/* Big-endian length in KMP message header */
-		store_be16(this->pulse.kmp + 18, this->len);
+		store_be32(&this->pulse.vendor, VENDOR_JUNIPER);
+		store_be32(&this->pulse.type, 4);
+		store_be32(&this->pulse.len, this->len + 16);
+		this->pulse.zero = 0;
 
 		vpn_progress(vpninfo, PRG_TRACE,
-			     _("Sending uncompressed data packet of %d bytes\n"),
+			     _("Sending IF-T/TLS data packet of %d bytes\n"),
 			     this->len);
 
+		vpninfo->current_ssl_pkt = this;
 		goto handle_outgoing;
 	}
-#endif
+
 	/* Work is not done if we just got rid of packets off the queue */
 	return work_done;
 }
 
 int pulse_bye(struct openconnect_info *vpninfo, const char *reason)
 {
-	char *orig_path;
-	char *res_buf=NULL;
-	int ret;
-
 	/* Send a4c/89/len 0x10 */
 
 	openconnect_close_https(vpninfo, 0);
