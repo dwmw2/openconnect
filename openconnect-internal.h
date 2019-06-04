@@ -137,6 +137,13 @@ struct pkt {
 			unsigned char pad[8];
 			unsigned char hdr[16];
 		} gpst;
+		struct {
+			unsigned char pad[8];
+			uint32_t vendor;
+			uint32_t type;
+			uint32_t len;
+			uint32_t zero;
+		} pulse;
 	};
 	unsigned char data[];
 };
@@ -862,6 +869,13 @@ int oncp_bye(struct openconnect_info *vpninfo, const char *reason);
 void oncp_esp_close(struct openconnect_info *vpninfo);
 int oncp_esp_send_probes(struct openconnect_info *vpninfo);
 int oncp_esp_catch_probe(struct openconnect_info *vpninfo, struct pkt *pkt);
+
+/* pulse.c */
+int pulse_obtain_cookie(struct openconnect_info *vpninfo);
+void pulse_common_headers(struct openconnect_info *vpninfo, struct oc_text_buf *buf);
+int pulse_connect(struct openconnect_info *vpninfo);
+int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
+int pulse_bye(struct openconnect_info *vpninfo, const char *reason);
 
 /* auth-globalprotect.c */
 int gpst_obtain_cookie(struct openconnect_info *vpninfo);
