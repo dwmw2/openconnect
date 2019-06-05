@@ -142,7 +142,7 @@ struct pkt {
 			uint32_t vendor;
 			uint32_t type;
 			uint32_t len;
-			uint32_t zero;
+			uint32_t ident;
 		} pulse;
 	};
 	unsigned char data[];
@@ -566,6 +566,8 @@ struct openconnect_info {
 	unsigned char dtls_secret[TLS_MASTER_KEY_SIZE];
 	unsigned char dtls_app_id[32];
 	unsigned dtls_app_id_size;
+
+	uint32_t ift_seq;
 
 	int cisco_dtls12;
 	char *dtls_cipher;

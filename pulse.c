@@ -34,17 +34,21 @@
 #include <stdarg.h>
 #include <sys/types.h>
 
+#define VENDOR_JUNIPER 0xa4c
+#define VENDOR_JUNIPER2 0x583
 #define VENDOR_TCG 0x5597
 
 #define IFT_VERSION_REQUEST 1
 #define IFT_VERSION_RESPONSE 2
-#define IFT_SASL_MECHANISMS 3
-#define IFT_SASL_MECH_SELECT 4
-#define IFT_SASL_DATA 5
-#define IFT_SASL_RESULT 6
+#define IFT_CLIENT_AUTH_REQUEST 3
+#define IFT_CLIENT_AUTH_SELECTION 4
+#define IFT_CLIENT_AUTH_CHALLENGE 5
+#define IFT_CLIENT_AUTH_RESPONSE 6
+#define IFT_CLIENT_AUTH_SUCCESS 7
 
-#define VENDOR_JUNIPER 0xa4c
-#define VENDOR_JUNIPER2 0x583
+/* IF-T/TLS v1 authentication messages all start
+ * with the Auth Type Vendor (Juniper) + Type (1) */
+#define JUNIPER_1 ((VENDOR_JUNIPER << 8) | 1)
 
 #define AVP_VENDOR 0x80
 #define AVP_MANDATORY 0x40
@@ -60,14 +64,9 @@
 
 #define EXPANDED_JUNIPER ((EAP_TYPE_EXPANDED << 24) | VENDOR_JUNIPER)
 
-/* First word of all IF-T SASL packets */
-#define JUNIPER_1 ((VENDOR_JUNIPER << 8) | 1)
+#define AVP_CODE_EAP_MESSAGE 79
 
 #include "openconnect-internal.h"
-int pulse_obtain_cookie(struct openconnect_info *vpninfo)
-{
-	return -EINVAL;
-}
 
 static void buf_append_be16(struct oc_text_buf *buf, uint16_t val)
 {
@@ -87,26 +86,35 @@ static void buf_append_be32(struct oc_text_buf *buf, uint32_t val)
 	buf_append_bytes(buf, b, 4);
 }
 
-static void buf_append_ift_hdr(struct oc_text_buf *buf, uint32_t vendor, uint32_t type)
+static void buf_append_ift_hdr(struct oc_text_buf *buf, uint32_t vendor, uint32_t type, uint32_t seq)
 {
 	uint32_t b[4];
 
-	b[2] = 0;
-	b[3] = 0;
 	store_be32(&b[0], vendor);
 	store_be32(&b[1], type);
+	b[2] = 0; /* Length will be filled in later. */
+	store_be32(&b[3], seq);
 	buf_append_bytes(buf, b, 16);
+}
+
+/* If a buf contains an IF-T/TLS frame, fill in the length word
+ * at offset 8 in its header, with the full length of the buf */
+static void buf_fill_ift_len(struct oc_text_buf *buf)
+{
+	if (!buf_error(buf) && buf->pos > 8)
+		store_be32(buf->data + 8, buf->pos);
 }
 
 /* Append EAP header, using VENDOR_JUNIPER and the given subtype if
  * the main type is EAP_TYPE_EXPANDED */
-static void buf_append_eap_hdr(struct oc_text_buf *buf, uint8_t code, uint8_t ident, uint8_t type,
+static int buf_append_eap_hdr(struct oc_text_buf *buf, uint8_t code, uint8_t ident, uint8_t type,
 			       uint32_t subtype)
 {
 	unsigned char b[24];
+	int len_ofs = -1;
 
-	/* All IF-T SASL frames start with this */
-	buf_append_be32(buf, JUNIPER_1);
+	if (!buf_error(buf))
+		len_ofs = buf->pos;
 
 	b[0] = code;
 	b[1] = ident;
@@ -119,19 +127,17 @@ static void buf_append_eap_hdr(struct oc_text_buf *buf, uint8_t code, uint8_t id
 		b[4] = type;
 		buf_append_bytes(buf, b, 5);
 	}
+	return len_ofs;
 }
 
-static void buf_fill_ift_len(struct oc_text_buf *buf)
-{
-	if (!buf_error(buf) && buf->pos > 8)
-		store_be32(buf->data + 8, buf->pos);
-}
-
-static void buf_fill_eap_len(struct oc_text_buf *buf)
+/* For an IF-T/TLS auth frame containing the Juniper/1 Auth Type,
+ * the EAP header is at offset 0x14. Fill in the length field,
+ * based on the current length of the buf */
+static void buf_fill_eap_len(struct oc_text_buf *buf, int ofs)
 {
 	/* EAP length word is always at 0x16, and counts bytes from 0x14 */
-	if (!buf_error(buf) && buf->pos > 0x18)
-		store_be16(buf->data + 0x16, buf->pos - 0x14);
+	if (ofs >= 0 && !buf_error(buf) && buf->pos > ofs + 8)
+		store_be16(buf->data + ofs + 2, buf->pos - ofs);
 }
 
 static void buf_append_avp(struct oc_text_buf *buf, uint32_t type, const void *bytes, int len)
@@ -159,20 +165,57 @@ static void buf_append_avp_string(struct oc_text_buf *buf, uint32_t type, const 
 {
 	buf_append_avp(buf, type, str, strlen(str));
 }
-#if 0
 
-static void buf_append_tlv_be32(struct oc_text_buf *buf, uint16_t val, uint32_t data)
+static int valid_ift_success(unsigned char *bytes, int len)
 {
-	unsigned char d[4];
+	if (len != 0x18 || (load_be32(bytes) & 0xffffff) != VENDOR_TCG ||
+	    load_be32(bytes + 4) != IFT_CLIENT_AUTH_SUCCESS ||
+	    load_be32(bytes + 8) != len ||
+	    load_be32(bytes + 0x10) != JUNIPER_1 ||
+	    bytes[0x14] != EAP_SUCCESS ||
+	    load_be16(bytes + 0x16) != len - 0x14)
+		return 0;
 
-	store_be32(d, data);
-
-	buf_append_tlv(buf, val, 4, d);
+	return 1;
 }
 
-static const char authpkt_head[] = { 0x00, 0x04, 0x00, 0x00, 0x00 };
-static const char authpkt_tail[] = { 0xbb, 0x01, 0x00, 0x00, 0x00, 0x00 };
+/* Check for a valid IF-T/TLS auth challenge of the Juniper/1 Auth Type */
+static int valid_ift_auth(unsigned char *bytes, int len)
+{
+	if (len < 0x14 || (load_be32(bytes) & 0xffffff) != VENDOR_TCG ||
+	    load_be32(bytes + 4) != IFT_CLIENT_AUTH_CHALLENGE ||
+	    load_be32(bytes + 8) != len ||
+	    load_be32(bytes + 0x10) != JUNIPER_1)
+		return 0;
 
+	return 1;
+}
+
+
+static int valid_ift_auth_eap(unsigned char *bytes, int len)
+{
+	/* Needs to be a valid IF-T/TLS auth challenge with the
+	 * expect Auth Type, *and* the payload has to be a valid
+	 * EAP request with correct length field. */
+	if (!valid_ift_auth(bytes, len) || len < 0x19 ||
+	    bytes[0x14] != EAP_REQUEST ||
+	    load_be16(bytes + 0x16) != len - 0x14)
+		return 0;
+
+	return 1;
+}
+
+static int valid_ift_auth_eap_exj1(unsigned char *bytes, int len)
+{
+	/* Also needs to be the Expanded Juniper/1 EAP Type */
+	if (!valid_ift_auth_eap(bytes, len) || len < 0x20 ||
+	    load_be32(bytes + 0x18) != EXPANDED_JUNIPER ||
+	    load_be32(bytes + 0x1c) != 1)
+		return 0;
+
+	return 1;
+}
+#if 0
 #define GRP_ATTR(g, a) (((g) << 16) | (a))
 
 /* We behave like CSTP — create a linked list in vpninfo->cstp_options
@@ -474,11 +517,16 @@ static void put_len32(struct oc_text_buf *buf, int where)
 
 #endif
 
-/* XX: This is actually a lot of duplication with the CSTP version. */
-void pulse_common_headers(struct openconnect_info *vpninfo, struct oc_text_buf *buf)
+static int recv_ift_packet(struct openconnect_info *vpninfo, void *buf, int len)
 {
+	int ret = vpninfo->ssl_read(vpninfo, buf, len);
+	if (ret > 0 && vpninfo->dump_http_traffic) {
+		vpn_progress(vpninfo, PRG_TRACE,
+			     _("Read %d bytes of IF-T/TLS record\n"), ret);
+		dump_buf_hex(vpninfo, PRG_TRACE, '<', buf, ret);
+	}
+	return ret;
 }
-
 static int send_ift_packet(struct openconnect_info *vpninfo, struct oc_text_buf *buf)
 {
 	int ret;
@@ -502,69 +550,176 @@ static int send_ift_packet(struct openconnect_info *vpninfo, struct oc_text_buf 
 	return 0;
 }
 
-static void process_avp(struct openconnect_info *vpninfo, uint8_t flags,
-		       uint32_t vendor, uint32_t code, void *p, int len)
+static void dump_avp(struct openconnect_info *vpninfo, uint8_t flags,
+		     uint32_t vendor, uint32_t code, void *p, int len)
 {
-	if (flags & AVP_VENDOR)
-		vpn_progress(vpninfo, PRG_TRACE, _("AVP 0x%x/0x%x:\n"), vendor, code);
+	struct oc_text_buf *buf = buf_alloc();
+	const char *pretty;
+	int i;
+
+	for (i = 0; i < len; i++)
+		if (!isprint( ((char *)p)[i] ))
+			break;
+
+	if (i == len) {
+		buf_append(buf, " '");
+		buf_append_bytes(buf, p, len);
+		buf_append(buf, "'");
+	} else {
+		for (i = 0; i < len; i++)
+			buf_append(buf, " %02x", ((unsigned char *)p)[i]);
+	}
+	if (buf_error(buf))
+		pretty = " <error>";
 	else
-		vpn_progress(vpninfo, PRG_TRACE, _("AVP %d:\n"), code);
-	dump_buf_hex(vpninfo, PRG_TRACE, ' ', p, len);
+		pretty = buf->data;
+
+	if (flags & AVP_VENDOR)
+		vpn_progress(vpninfo, PRG_TRACE, _("AVP 0x%x/0x%x:%s\n"), vendor, code, pretty);
+	else
+		vpn_progress(vpninfo, PRG_TRACE, _("AVP %d:%s\n"), code, pretty);
+	buf_free(buf);
 }
 
 /* RFC5281 §10 */
-static int process_avps(struct openconnect_info *vpninfo, void *_p, int l)
+static int parse_avp(struct openconnect_info *vpninfo, void **pkt, int *pkt_len,
+		    void **avp_out, int *avp_len, uint8_t *avp_flags,
+		    uint32_t *avp_vendor, uint32_t *avp_code)
 {
-	unsigned char *p = _p;
-	uint32_t avp_code;
-	uint32_t avp_len;
-	uint32_t avp_vendor;
+	unsigned char *p = *pkt;
+	int l = *pkt_len;
+	uint32_t code, len, vendor = 0;
 	uint8_t flags;
 
-	while (l) {
-		if (l < 8) {
-		bad_len:
-			vpn_progress(vpninfo, PRG_ERR,
-				     _("Failed to parse AVP in Pulse packet; invalid length\n"));
+	if (l < 8)
+		return -EINVAL;
+
+	code = load_be32(p);
+	len = load_be32(p + 4) & 0xffffff;
+	flags = p[4];
+
+	if (len > l || len < 8)
+		return -EINVAL;
+
+	p += 8;
+	l -= 8;
+	len -= 8;
+
+	/* Vendor field is optional. */
+	if (flags & AVP_VENDOR) {
+		if (l < 4)
 			return -EINVAL;
-		}
-		avp_code = load_be32(p);
-		avp_len = load_be32(p + 4) & 0xffffff;
-		flags = p[4];
-
-		if (avp_len > l || avp_len < 8)
-			goto bad_len;
-		if (flags & AVP_VENDOR) {
-			if (l < 12 || avp_len < 12)
-				goto bad_len;
-			avp_vendor = load_be32(p + 8);
-			p += 12;
-			l -= 12;
-			avp_len -= 12;
-		} else {
-			if (avp_len < 8)
-				goto bad_len;
-			avp_vendor = 0;
-			p += 8;
-			l -= 8;
-			avp_len -= 8;
-		}
-
-		process_avp(vpninfo, flags, avp_vendor, avp_code, p, avp_len);
-		avp_len = (avp_len + 3) & ~3;
-		if (avp_len > l)
-			return 0;
-		p += avp_len;
-		l -= avp_len;
+		vendor = load_be32(p);
+		p += 4;
+		l -= 4;
+		len -= 4;
 	}
+
+	*avp_vendor = vendor;
+	*avp_flags = flags;
+	*avp_code = code;
+	*avp_out = p;
+	*avp_len = len;
+
+	/* Now set up packet pointer and length for next AVP,
+	 * aligned to 4 octets (if they exist in the packet) */
+	len = (len + 3) & ~3;
+	if (len > l)
+		len = l;
+	*pkt = p + len;
+	*pkt_len = l - len;
+
 	return 0;
 }
 
-int pulse_connect(struct openconnect_info *vpninfo)
+
+static int pulse_request_user_auth(struct openconnect_info *vpninfo, struct oc_text_buf *reqbuf,
+				   uint8_t eap_ident)
+{
+	struct oc_auth_form f;
+	struct oc_form_opt o[2];
+	int ret;
+
+	memset(&f, 0, sizeof(f));
+	memset(o, 0, sizeof(o));
+        f.auth_id = (char *)"pulse_user";
+        f.opts = &o[0];
+
+	f.message = _("Enter user credentials:");
+
+	o[0].next = &o[1];
+	o[0].type = OC_FORM_OPT_TEXT;
+	o[0].name = (char *)"username";
+	o[0].label = (char *)_("Username:");
+
+	o[1].type = OC_FORM_OPT_PASSWORD;
+	o[1].name = (char *)"password";
+	o[1].label = (char *)_("Password:");
+
+	ret = process_auth_form(vpninfo, &f);
+	if (ret)
+		return ret;
+
+	if (o[0]._value) {
+		buf_append_avp_string(reqbuf, 0xd6d, o[0]._value);
+		free_pass(&o[0]._value);
+	}
+	if (o[1]._value) {
+		unsigned char eap_avp[23];
+		int l = strlen(o[1]._value);
+		if (l > 253) {
+			free_pass(&o[1]._value);
+			return -EINVAL;
+		}
+
+		/* AVP flags+mandatory+length */
+		store_be32(eap_avp, AVP_CODE_EAP_MESSAGE);
+		store_be32(eap_avp + 4, (AVP_MANDATORY << 24) + sizeof(eap_avp) + l);
+
+		/* EAP header: code/ident/len */
+		eap_avp[8] = EAP_RESPONSE;
+		eap_avp[9] = eap_ident;
+		store_be16(eap_avp + 10, l + 15); /* EAP length */
+		store_be32(eap_avp + 12, EXPANDED_JUNIPER);
+		store_be32(eap_avp + 16, 2);
+
+		/* EAP Juniper/2 payload: 02 02 <len> <password> */
+		eap_avp[20] = eap_avp[21] = 0x02;
+		eap_avp[22] = l + 2; /* Why 2? */
+		buf_append_bytes(reqbuf, eap_avp, sizeof(eap_avp));
+		buf_append_bytes(reqbuf, o[1]._value, l);
+
+		/* Padding */
+		if ((sizeof(eap_avp) + l) & 3) {
+			uint32_t pad = 0;
+
+			buf_append_bytes(reqbuf, &pad,
+					 4 - ((sizeof(eap_avp) + l) & 3));
+		}
+		free_pass(&o[1]._value);
+	}
+
+	return 0;
+}
+/* IF-T/TLS session establishment is the same for both pulse_obtain_cookie() and
+ * pulse_connect(). We have to go through the EAP phase of the connection either
+ * way; it's just that we might do it with just the cookie, or we might need to
+ * use the password/cert etc. */
+static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 {
 	int ret;
 	struct oc_text_buf *reqbuf;
 	unsigned char bytes[16384];
+	int eap_ofs;
+	uint8_t eap_ident, eap2_ident = 0;
+	uint8_t avp_flags;
+	uint32_t avp_code;
+	uint32_t avp_vendor;
+	int avp_len, l;
+	void *avp_p, *p;
+	int cookie_found = 0;
+	int j2_found = 0;
+	uint8_t j2_code = 0;
 
 	/* XXX: We should do what cstp_connect() does to check that configuration
 	   hasn't changed on a reconnect. */
@@ -607,37 +762,35 @@ int pulse_connect(struct openconnect_info *vpninfo)
 		goto out;
 	}
 
+	vpninfo->ift_seq = 0;
 	/* IF-T version request. */
 	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_VERSION_REQUEST);
-	/* min=1, max=2, preferred version=2 */
-	buf_append_be32(reqbuf, 0x00010202);
+	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_VERSION_REQUEST, vpninfo->ift_seq++);
+	/* min=1, max=1, preferred version=1 */
+	buf_append_be32(reqbuf, 0x00010101);
 	ret = send_ift_packet(vpninfo, reqbuf);
 	if (ret)
 		goto out;
 
-	ret = vpninfo->ssl_read(vpninfo, (void *)bytes, sizeof(bytes));
+	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
 	if (ret < 0)
 		goto out;
-	vpn_progress(vpninfo, PRG_TRACE,
-		     _("Read %d bytes of SSL record\n"), ret);
-	dump_buf_hex(vpninfo, PRG_TRACE, '<', (void *)bytes, ret);
 
 	if (ret != 0x14 || (load_be32(bytes) & 0xffffff) != VENDOR_TCG ||
 	    load_be32(bytes + 4) != IFT_VERSION_RESPONSE ||
 	    load_be32(bytes + 8) != 0x14) {
 		vpn_progress(vpninfo, PRG_ERR,
-			     _("Unexpected response to IF-T version negotiation:\n"));
+			     _("Unexpected response to IF-T/TLS version negotiation:\n"));
 		dump_buf_hex(vpninfo, PRG_ERR, '<', (void *)bytes, ret);
 		ret = -EINVAL;
 		goto out;
 	}
-	vpn_progress(vpninfo, PRG_TRACE, _("IF-T version from server: %d\n"),
+	vpn_progress(vpninfo, PRG_TRACE, _("IF-T/TLS version from server: %d\n"),
 		     bytes[0x13]);
 
 	/* Client information packet */
 	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_JUNIPER, 0x88);
+	buf_append_ift_hdr(reqbuf, VENDOR_JUNIPER, 0x88, vpninfo->ift_seq++);
 	buf_append(reqbuf, "clientHostName=%s", vpninfo->localname);
 	bytes[0] = 0;
 	if (vpninfo->peer_addr && vpninfo->peer_addr->sa_family == AF_INET6) {
@@ -659,146 +812,246 @@ int pulse_connect(struct openconnect_info *vpninfo)
 		goto out;
 
 	/* Await start of auth negotiations */
-	ret = vpninfo->ssl_read(vpninfo, (void *)bytes, sizeof(bytes));
+	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
 	if (ret < 0)
 		goto out;
-	vpn_progress(vpninfo, PRG_TRACE,
-		     _("Read %d bytes of SSL record\n"), ret);
-	dump_buf_hex(vpninfo, PRG_TRACE, '<', (void *)bytes, ret);
 
-	if (ret != 0x14 || (load_be32(bytes) & 0xffffff) != VENDOR_TCG ||
-	    load_be32(bytes + 4) != IFT_SASL_DATA ||
-	    load_be32(bytes + 8) != 0x14 ||
-	    load_be32(bytes + 0x10) != JUNIPER_1) {
+	/* Basically an empty packet, without even an EAP header */
+	if (!valid_ift_auth(bytes, ret) || ret != 0x14) {
 		vpn_progress(vpninfo, PRG_ERR,
-			     _("Unexpected SASL challenge:\n"));
+			     _("Unexpected IF-T/TLS authentication challenge:\n"));
 		dump_buf_hex(vpninfo, PRG_ERR, '<', (void *)bytes, ret);
 		ret = -EINVAL;
 		goto out;
 	}
 
+	/* Start by sending an EAP Identity of 'anonymous' */
 	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_SASL_RESULT);
-	buf_append_eap_hdr(reqbuf, EAP_RESPONSE, 1, EAP_TYPE_IDENTITY, 0);
+	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
+	buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
+	eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, 1, EAP_TYPE_IDENTITY, 0);
 	buf_append(reqbuf, "anonymous");
-	buf_fill_eap_len(reqbuf);
+	buf_fill_eap_len(reqbuf, eap_ofs);
 	ret = send_ift_packet(vpninfo, reqbuf);
 	if (ret)
 		goto out;
 
-	/* Await start of auth negotiations */
-	ret = vpninfo->ssl_read(vpninfo, (void *)bytes, sizeof(bytes));
+	/* Noe the real negotiation starts */
+	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
 	if (ret < 0)
 		goto out;
-	vpn_progress(vpninfo, PRG_TRACE,
-		     _("Read %d bytes of SSL record\n"), ret);
-	dump_buf_hex(vpninfo, PRG_TRACE, '<', (void *)bytes, ret);
 
-	if (ret < 0x19 || (load_be32(bytes) & 0xffffff) != VENDOR_TCG ||
-	    load_be32(bytes + 4) != IFT_SASL_DATA ||
-	    load_be32(bytes + 8) < 0x14 ||
-	    load_be32(bytes + 0x10) != JUNIPER_1 ||
-	    bytes[0x14] != EAP_REQUEST ||
-	    load_be16(bytes + 0x16) != ret - 0x14) {
+	/* Check EAP header and length */
+	if (!valid_ift_auth_eap(bytes, ret)) {
 	bad_eap:
 		vpn_progress(vpninfo, PRG_ERR,
-			     _("Unexpected SASL challenge:\n"));
+			     _("Unexpected IF-T/TLS authentication challenge:\n"));
 		dump_buf_hex(vpninfo, PRG_ERR, '<', (void *)bytes, ret);
 		ret = -EINVAL;
 		goto out;
 	}
 
+	/* Need to include this in our response */
+	eap_ident = bytes[0x15];
+
 	/* Check requested EAP type */
-	if (bytes[0x18] == 0x15) {
+	if (bytes[0x18] == EAP_TYPE_TTLS) {
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Certificate auth via EAP-TTLS not yet supported for Pulse\n"));
 		ret = -EINVAL;
 		goto out;
 	}
-	if (ret < 0x20 || load_be32(bytes + 0x18) != EXPANDED_JUNIPER ||
-	    load_be32(bytes + 0x1c) != 1)
+
+	/* Check for the thing we *do* support, which is EAP Expanded
+	 * with Vendor == Juniper, Type == 1. */
+	if (!valid_ift_auth_eap_exj1(bytes, ret))
 		goto bad_eap;
 
-	/* OK, we have an expanded Juniper/1 frame and we know the EAP length matches
-	 * the actual length of what we read, as does the IF-T/TLS header. */
-	ret = process_avps(vpninfo, bytes + 0x20, ret - 0x20);
-	if (ret)
-		goto out;
+	/* We don't actually use anything we get here. Typically it
+	 * contains Juniper/0xd49 and Juniper/0xd4a word AVPs, and
+	 * a Juniper/0xd56 AVP with server licensing information. */
+	p = bytes + 0x20;
+	l = ret - 0x20;
+	while (l) {
+		if (parse_avp(vpninfo, &p, &l, &avp_p, &avp_len, &avp_flags,
+			      &avp_vendor, &avp_code)) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Failed to parse AVP\n"));
+			goto bad_eap;
+		}
+		dump_avp(vpninfo, avp_flags, avp_vendor, avp_code, avp_p, avp_len);
+	}
 
 	/* Present the auth cookie */
 	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_SASL_RESULT);
-	buf_append_eap_hdr(reqbuf, EAP_RESPONSE, bytes[0x15], EAP_TYPE_EXPANDED, 1);
-	//buf_append_avp_string(reqbuf, 0xd5e, vpninfo->platname);
+	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
+	buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
+	eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, eap_ident, EAP_TYPE_EXPANDED, 1);
+
+	/* Their client sends a lot of other stuff here, which we don't
+	 * understand and which doesn't appear to be mandatory. So leave
+	 * it out for now until/unless it becomes necessary. */
 	buf_append_avp_string(reqbuf, 0xd70, vpninfo->useragent);
-	buf_append_avp_string(reqbuf, 0xd53, vpninfo->cookie);
-	buf_fill_eap_len(reqbuf);
+	if (vpninfo->cookie)
+		buf_append_avp_string(reqbuf, 0xd53, vpninfo->cookie);
+	buf_fill_eap_len(reqbuf, eap_ofs);
 	ret = send_ift_packet(vpninfo, reqbuf);
 	if (ret)
 		goto out;
 
 
 	/* Await start of auth negotiations */
-	ret = vpninfo->ssl_read(vpninfo, (void *)bytes, sizeof(bytes));
+ auth_response:
+	j2_found = 0;
+	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
 	if (ret < 0)
 		goto out;
-	vpn_progress(vpninfo, PRG_TRACE,
-		     _("Read %d bytes of SSL record\n"), ret);
-	dump_buf_hex(vpninfo, PRG_TRACE, '<', (void *)bytes, ret);
 
-	if (ret < 0x19 || (load_be32(bytes) & 0xffffff) != VENDOR_TCG ||
-	    load_be32(bytes + 4) != IFT_SASL_DATA ||
-	    load_be32(bytes + 8) < 0x14 ||
-	    load_be32(bytes + 0x10) != JUNIPER_1 ||
-	    bytes[0x14] != EAP_REQUEST ||
-	    load_be16(bytes + 0x16) != ret - 0x14)
+	if (!valid_ift_auth_eap_exj1(bytes, ret))
 		goto bad_eap;
 
-	if (ret < 0x20 || load_be32(bytes + 0x18) != EXPANDED_JUNIPER ||
-	    load_be32(bytes + 0x1c) != 1)
-		goto bad_eap;
+	eap_ident = bytes[0x15];
 
-	// XXX: Check for validity
-	ret = process_avps(vpninfo, bytes + 0x20, ret - 0x20);
-	if (ret)
-		goto out;
+	p = bytes + 0x20;
+	l = ret - 0x20;
+	while (l) {
+		if (parse_avp(vpninfo, &p, &l, &avp_p, &avp_len, &avp_flags,
+			      &avp_vendor, &avp_code)) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Failed to parse AVP\n"));
+			goto bad_eap;
+		}
+		dump_avp(vpninfo, avp_flags, avp_vendor, avp_code, avp_p, avp_len);
 
+		/* It's a bit late for this given that we don't get it until after
+		 * we provide the password. */
+		if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd55) {
+			char md5buf[MD5_SIZE * 2 + 1];
+			get_cert_md5_fingerprint(vpninfo, vpninfo->peer_cert, md5buf);
+			if (avp_len != MD5_SIZE * 2 || strncasecmp(avp_p, md5buf, MD5_SIZE * 2)) {
+				vpn_progress(vpninfo, PRG_ERR,
+					     _("Server certificate mismatch. Aborting due to suspected MITM attack\n"));
+				ret = -EPERM;
+				goto out;
+			}
+		}
+		if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd65) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Too many Pulse VPN sessions open\n"));
+			ret = -EPERM;
+			goto out;
+		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd53) {
+			free(vpninfo->cookie);
+			vpninfo->cookie = strndup(avp_p, avp_len);
+			cookie_found = 1;
+		} else if (!avp_vendor && avp_code == AVP_CODE_EAP_MESSAGE) {
+			char *avp_c = avp_p;
 
-	/* Present the auth cookie */
+			/* EAP within AVP within EAP within IF-T/TLS.
+			 * The only thing we understand here is another form of Expanded EAP,
+			 * this time with the type Juniper/2. */
+			if (avp_len != 13 || avp_c[0] != EAP_REQUEST ||
+			    load_be16(avp_c + 2) != avp_len ||
+			    load_be32(avp_c + 4) != EXPANDED_JUNIPER ||
+			    load_be32(avp_c + 8) != 2)
+				goto bad_eap;
+
+			j2_found = 1;
+			j2_code = avp_c[12];
+			eap2_ident = avp_c[1];
+		} else if (avp_flags & AVP_MANDATORY)
+			goto bad_eap;
+	}
+
+	if (!cookie_found) {
+		if (connecting) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Pulse authentication cookie not accepted\n"));
+			ret = -EPERM;
+			goto out;
+		}
+		if (!j2_found)
+			goto bad_eap;
+
+		/* Construct auth packet for response */
+		buf_truncate(reqbuf);
+		buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
+		buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
+		eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, eap_ident, EAP_TYPE_EXPANDED, 1);
+
+		/* Present user/password form to user */
+		ret = pulse_request_user_auth(vpninfo, reqbuf, eap2_ident);
+		if (ret)
+			goto out;
+
+		buf_fill_eap_len(reqbuf, eap_ofs);
+		ret = send_ift_packet(vpninfo, reqbuf);
+		if (ret)
+			goto out;
+
+		goto auth_response;
+	}
+
+	/* We're done, but need to send an empty response to the above information
+	 * in order that the EAP session can complete with 'success'. Not quite
+	 * sure why they didn't send it as payload on the success frame, mind you. */
 	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_SASL_RESULT);
-	buf_append_eap_hdr(reqbuf, EAP_RESPONSE, bytes[0x15], EAP_TYPE_EXPANDED, 1);
-	buf_fill_eap_len(reqbuf);
+	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
+	buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
+	eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, bytes[0x15], EAP_TYPE_EXPANDED, 1);
+	buf_fill_eap_len(reqbuf, eap_ofs);
 	ret = send_ift_packet(vpninfo, reqbuf);
 	if (ret)
 		goto out;
 
-	while (0) {
-		ret = vpninfo->ssl_read(vpninfo, (void *)bytes, 16384);
-		if (ret < 0)
-			goto out;
-		vpn_progress(vpninfo, PRG_TRACE,
-			     _("Read %d bytes of SSL record\n"), ret);
-		dump_buf_hex(vpninfo, PRG_TRACE, '<', (void *)bytes, ret);
-		if (bytes[7] == 0x93) {
-			bytes[ret] = 0;
-			printf("%s", bytes + 16);
-		}
+	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
+	if (ret < 0)
+		goto out;
+
+	if (!valid_ift_success(bytes, ret)) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Unexpected response instead of IF-T/TLS auth success:\n"));
+		dump_buf_hex(vpninfo, PRG_ERR, '<', (void *)bytes, ret);
+		ret = -EINVAL;
+		goto out;
 	}
+
 	ret = 0;
  out:
 	if (ret)
 		openconnect_close_https(vpninfo, 0);
-	else {
-		monitor_fd_new(vpninfo, ssl);
-		monitor_read_fd(vpninfo, ssl);
-		monitor_except_fd(vpninfo, ssl);
-	}
+
 	buf_free(reqbuf);
+
+	return ret;
+}
+
+int pulse_obtain_cookie(struct openconnect_info *vpninfo)
+{
+	return pulse_authenticate(vpninfo, 0);
+}
+
+int pulse_connect(struct openconnect_info *vpninfo)
+{
+	int ret = 0;
+
+	/* If we already have a channel open, it's because we have just
+	 * successfully authenticated on it from pulse_obtain_cookie(). */
+	if (vpninfo->ssl_fd == -1) {
+		ret = pulse_authenticate(vpninfo, 1);
+		if (ret)
+			return ret;
+	}
+
+	monitor_fd_new(vpninfo, ssl);
+	monitor_read_fd(vpninfo, ssl);
+	monitor_except_fd(vpninfo, ssl);
 
 	free(vpninfo->cstp_pkt);
 	vpninfo->cstp_pkt = NULL;
-	vpninfo->ip_info.mtu= 1400;
+
+	vpninfo->ip_info.mtu = 1400;
+
 	return ret;
 }
 
@@ -1023,7 +1276,7 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 		store_be32(&this->pulse.vendor, VENDOR_JUNIPER);
 		store_be32(&this->pulse.type, 4);
 		store_be32(&this->pulse.len, this->len + 16);
-		this->pulse.zero = 0;
+		store_be32(&this->pulse.ident, vpninfo->ift_seq++);
 
 		vpn_progress(vpninfo, PRG_TRACE,
 			     _("Sending IF-T/TLS data packet of %d bytes\n"),
@@ -1039,9 +1292,15 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 
 int pulse_bye(struct openconnect_info *vpninfo, const char *reason)
 {
-	/* Send a4c/89/len 0x10 */
+	if (vpninfo->ssl_fd != -1) {
+		struct oc_text_buf *buf = buf_alloc();
+		buf_append_ift_hdr(buf, VENDOR_JUNIPER, 0x89, vpninfo->ift_seq++);
+		if (!buf_error(buf))
+			send_ift_packet(vpninfo, buf);
+		buf_free(buf);
 
-	openconnect_close_https(vpninfo, 0);
+		openconnect_close_https(vpninfo, 0);
+	}
 	return 0;
 }
 
