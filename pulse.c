@@ -153,14 +153,6 @@ static void buf_append_avp(struct oc_text_buf *buf, uint32_t type, const void *b
 	}
 }
 
-static void buf_append_avp_be32(struct oc_text_buf *buf, uint32_t type, uint32_t val)
-{
-	uint32_t val_be;
-
-	store_be32(&val_be, val);
-	buf_append_avp(buf, type, &val_be, 4);
-}
-
 static void buf_append_avp_string(struct oc_text_buf *buf, uint32_t type, const char *str)
 {
 	buf_append_avp(buf, type, str, strlen(str));
@@ -215,8 +207,6 @@ static int valid_ift_auth_eap_exj1(unsigned char *bytes, int len)
 
 	return 1;
 }
-#if 0
-#define GRP_ATTR(g, a) (((g) << 16) | (a))
 
 /* We behave like CSTP — create a linked list in vpninfo->cstp_options
  * with the strings containing the information we got from the server,
@@ -249,28 +239,33 @@ static const char *add_option(struct openconnect_info *vpninfo, const char *opt,
 	return new->value;
 }
 
-static int process_attr(struct openconnect_info *vpninfo, int group, int attr,
+static int process_attr(struct openconnect_info *vpninfo, uint16_t type,
 			unsigned char *data, int attrlen)
 {
 	char buf[80];
 	int i;
 
-	switch(GRP_ATTR(group, attr)) {
-	case GRP_ATTR(6, 2):
-		if (attrlen != 4) {
-		badlen:
-			vpn_progress(vpninfo, PRG_ERR,
-				     _("Unexpected length %d for TLV %d/%d\n"),
-				     attrlen, group, attr);
-			return -EINVAL;
-		}
-		vpninfo->ip_info.mtu = load_be32(data);
-		vpn_progress(vpninfo, PRG_DEBUG,
-			     _("Received MTU %d from server\n"),
-			     vpninfo->ip_info.mtu);
+	switch (type) {
+
+	case 0x0001:
+		if (attrlen != 4)
+			goto badlen;
+		snprintf(buf, sizeof(buf), "%d.%d.%d.%d", data[0], data[1], data[2], data[3]);
+
+		vpn_progress(vpninfo, PRG_DEBUG, _("Received internal Legacy IP address %s\n"), buf);
+		vpninfo->ip_info.addr = add_option(vpninfo, "ipaddr", buf, -1);
 		break;
 
-	case GRP_ATTR(2, 1):
+	case 0x0002:
+		if (attrlen != 4)
+			goto badlen;
+		snprintf(buf, sizeof(buf), "%d.%d.%d.%d", data[0], data[1], data[2], data[3]);
+
+		vpn_progress(vpninfo, PRG_DEBUG, _("Received netmask %s\n"), buf);
+		vpninfo->ip_info.netmask = add_option(vpninfo, "netmask", buf, -1);
+		break;
+
+	case 0x0003:
 		if (attrlen != 4)
 			goto badlen;
 		snprintf(buf, sizeof(buf), "%d.%d.%d.%d", data[0], data[1], data[2], data[3]);
@@ -285,91 +280,7 @@ static int process_attr(struct openconnect_info *vpninfo, int group, int attr,
 		}
 		break;
 
-	case GRP_ATTR(2, 2):
-		vpn_progress(vpninfo, PRG_DEBUG, _("Received DNS search domain %.*s\n"),
-			     attrlen, (char *)data);
-		vpninfo->ip_info.domain = add_option(vpninfo, "search", (char *)data, attrlen);
-		if (vpninfo->ip_info.domain) {
-			char *p = (char *)vpninfo->ip_info.domain;
-			while ((p = strchr(p, ',')))
-				*p = ' ';
-		}
-		break;
-
-	case GRP_ATTR(1, 1):
-		if (attrlen != 4)
-			goto badlen;
-		snprintf(buf, sizeof(buf), "%d.%d.%d.%d", data[0], data[1], data[2], data[3]);
-
-		vpn_progress(vpninfo, PRG_DEBUG, _("Received internal IP address %s\n"), buf);
-		vpninfo->ip_info.addr = add_option(vpninfo, "ipaddr", buf, -1);
-		break;
-
-	case GRP_ATTR(1, 2):
-		if (attrlen != 4)
-			goto badlen;
-		snprintf(buf, sizeof(buf), "%d.%d.%d.%d", data[0], data[1], data[2], data[3]);
-
-		vpn_progress(vpninfo, PRG_DEBUG, _("Received netmask %s\n"), buf);
-		vpninfo->ip_info.netmask = add_option(vpninfo, "netmask", buf, -1);
-		break;
-
-	case GRP_ATTR(1, 3):
-		if (attrlen != 4)
-			goto badlen;
-		snprintf(buf, sizeof(buf), "%d.%d.%d.%d", data[0], data[1], data[2], data[3]);
-
-		vpn_progress(vpninfo, PRG_DEBUG, _("Received internal gateway address %s\n"), buf);
-		/* Hm, what are we supposed to do with this? It's a tunnel;
-		   having a gateway is meaningless. */
-		add_option(vpninfo, "ipaddr", buf, -1);
-		break;
-
-	case GRP_ATTR(3, 3): {
-		struct oc_split_include *inc;
-		if (attrlen != 8)
-			goto badlen;
-		snprintf(buf, sizeof(buf), "%d.%d.%d.%d/%d.%d.%d.%d",
-			 data[0], data[1], data[2], data[3],
-			 data[4], data[5], data[6], data[7]);
-		vpn_progress(vpninfo, PRG_DEBUG, _("Received split include route %s\n"), buf);
-		if (!data[4] && !data[5] && !data[6] && !data[7])
-			break;
-		inc = malloc(sizeof(*inc));
-		if (inc) {
-			inc->route = add_option(vpninfo, "split-include", buf, -1);
-			if (inc->route) {
-				inc->next = vpninfo->ip_info.split_includes;
-				vpninfo->ip_info.split_includes = inc;
-			} else
-				free(inc);
-		}
-		break;
-	}
-
-	case GRP_ATTR(3, 4): {
-		struct oc_split_include *exc;
-		if (attrlen != 8)
-			goto badlen;
-		snprintf(buf, sizeof(buf), "%d.%d.%d.%d/%d.%d.%d.%d",
-			 data[0], data[1], data[2], data[3],
-			 data[4], data[5], data[6], data[7]);
-		vpn_progress(vpninfo, PRG_DEBUG, _("Received split exclude route %s\n"), buf);
-		if (!data[4] && !data[5] && !data[6] && !data[7])
-			break;
-		exc = malloc(sizeof(*exc));
-		if (exc) {
-			exc->route = add_option(vpninfo, "split-exclude", buf, -1);
-			if (exc->route) {
-				exc->next = vpninfo->ip_info.split_excludes;
-				vpninfo->ip_info.split_excludes = exc;
-			} else
-				free(exc);
-		}
-		break;
-	}
-
-	case GRP_ATTR(4, 1):
+	case 0x0004:
 		if (attrlen != 4)
 			goto badlen;
 		snprintf(buf, sizeof(buf), "%d.%d.%d.%d", data[0], data[1], data[2], data[3]);
@@ -384,69 +295,103 @@ static int process_attr(struct openconnect_info *vpninfo, int group, int attr,
 		}
 		break;
 
-	case GRP_ATTR(8, 1): {
-		const char *enctype;
-
-		if (attrlen != 1)
+	case 0x0008:
+		if (attrlen != 17)
 			goto badlen;
-		if (data[0] == ENC_AES_128_CBC) {
+		if (!inet_ntop(AF_INET6, data, buf, sizeof(buf))) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Failed to handle IPv6 address\n"));
+			return -EINVAL;
+		}
+		i = strlen(buf);
+		snprintf(buf + i, sizeof(buf) - i, "/%d", data[16]);
+		vpn_progress(vpninfo, PRG_DEBUG, _("Received internal IPv6 address %s\n"), buf);
+		vpninfo->ip_info.addr6 = add_option(vpninfo, "ip6addr", buf, -1);
+		break;
+
+	case 0x4005:
+		if (attrlen != 4) {
+		badlen:
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Unexpected length %d for attr 0x%x\n"),
+				     attrlen, type);
+			return -EINVAL;
+		}
+		vpninfo->ip_info.mtu = load_be32(data);
+		vpn_progress(vpninfo, PRG_DEBUG,
+			     _("Received MTU %d from server\n"),
+			     vpninfo->ip_info.mtu);
+		break;
+
+	case 0x4006:
+		if (!attrlen)
+			goto badlen;
+		if (!data[attrlen-1])
+		    attrlen--;
+		vpn_progress(vpninfo, PRG_DEBUG, _("Received DNS search domain %.*s\n"),
+			     attrlen, (char *)data);
+		vpninfo->ip_info.domain = add_option(vpninfo, "search", (char *)data, attrlen);
+		if (vpninfo->ip_info.domain) {
+			char *p = (char *)vpninfo->ip_info.domain;
+			while ((p = strchr(p, ',')))
+				*p = ' ';
+		}
+		break;
+
+	case 0x400b:
+		if (attrlen != 4)
+			goto badlen;
+		snprintf(buf, sizeof(buf), "%d.%d.%d.%d", data[0], data[1], data[2], data[3]);
+
+		vpn_progress(vpninfo, PRG_DEBUG, _("Received internal gateway address %s\n"), buf);
+		/* Hm, what are we supposed to do with this? It's a tunnel;
+		   having a gateway is meaningless. */
+		add_option(vpninfo, "ipaddr", buf, -1);
+		break;
+
+	case 0x4010: {
+		const char *enctype;
+		uint16_t val;
+
+		if (attrlen != 2)
+			goto badlen;
+		val = load_be16(data);
+		if (val == ENC_AES_128_CBC) {
 			enctype = "AES-128";
 			vpninfo->enc_key_len = 16;
-		} else if (data[0] == ENC_AES_256_CBC) {
+		} else if (val == ENC_AES_256_CBC) {
 			enctype = "AES-256";
 			vpninfo->enc_key_len = 32;
 		} else
 			enctype = "unknown";
-		vpn_progress(vpninfo, PRG_DEBUG, _("ESP encryption: 0x%02x (%s)\n"),
-			      data[0], enctype);
-		vpninfo->esp_enc = data[0];
+		vpn_progress(vpninfo, PRG_DEBUG, _("ESP encryption: 0x%04x (%s)\n"),
+			      val, enctype);
+		vpninfo->esp_enc = val;
 		break;
 	}
 
-	case GRP_ATTR(8, 2): {
+	case 0x4011: {
 		const char *mactype;
+		uint16_t val;
 
-		if (attrlen != 1)
+		if (attrlen != 2)
 			goto badlen;
-		if (data[0] == HMAC_MD5) {
+		val = load_be16(data);
+		if (val == HMAC_MD5) {
 			mactype = "MD5";
 			vpninfo->hmac_key_len = 16;
-		} else if (data[0] == HMAC_SHA1) {
+		} else if (val == HMAC_SHA1) {
 			mactype = "SHA1";
 			vpninfo->hmac_key_len = 20;
 		} else
 			mactype = "unknown";
-		vpn_progress(vpninfo, PRG_DEBUG, _("ESP HMAC: 0x%02x (%s)\n"),
-			      data[0], mactype);
-		vpninfo->esp_hmac = data[0];
+		vpn_progress(vpninfo, PRG_DEBUG, _("ESP HMAC: 0x%04x (%s)\n"),
+			      val, mactype);
+		vpninfo->esp_hmac = val;
 		break;
 	}
 
-	case GRP_ATTR(8, 3):
-		if (attrlen != 1)
-			goto badlen;
-		vpninfo->esp_compr = data[0];
-		vpninfo->dtls_compr = data[0] ? COMPR_LZO : 0;
-		vpn_progress(vpninfo, PRG_DEBUG, _("ESP compression: %d\n"), data[0]);
-		break;
-
-	case GRP_ATTR(8, 4):
-		if (attrlen != 2)
-			goto badlen;
-		i = load_be16(data);
-		udp_sockaddr(vpninfo, i);
-		vpn_progress(vpninfo, PRG_DEBUG, _("ESP port: %d\n"), i);
-		break;
-
-	case GRP_ATTR(8, 5):
-		if (attrlen != 4)
-			goto badlen;
-		vpninfo->esp_lifetime_bytes = load_be32(data);
-		vpn_progress(vpninfo, PRG_DEBUG, _("ESP key lifetime: %u bytes\n"),
-			     vpninfo->esp_lifetime_bytes);
-		break;
-
-	case GRP_ATTR(8, 6):
+	case 0x4012:
 		if (attrlen != 4)
 			goto badlen;
 		vpninfo->esp_lifetime_seconds = load_be32(data);
@@ -454,15 +399,15 @@ static int process_attr(struct openconnect_info *vpninfo, int group, int attr,
 			     vpninfo->esp_lifetime_seconds);
 		break;
 
-	case GRP_ATTR(8, 9):
+	case 0x4013:
 		if (attrlen != 4)
 			goto badlen;
-		vpninfo->esp_ssl_fallback = load_be32(data);
-		vpn_progress(vpninfo, PRG_DEBUG, _("ESP to SSL fallback: %u seconds\n"),
-			     vpninfo->esp_ssl_fallback);
+		vpninfo->esp_lifetime_bytes = load_be32(data);
+		vpn_progress(vpninfo, PRG_DEBUG, _("ESP key lifetime: %u bytes\n"),
+			     vpninfo->esp_lifetime_bytes);
 		break;
 
-	case GRP_ATTR(8, 10):
+	case 0x4014:
 		if (attrlen != 4)
 			goto badlen;
 		vpninfo->esp_replay_protect = load_be32(data);
@@ -470,6 +415,30 @@ static int process_attr(struct openconnect_info *vpninfo, int group, int attr,
 			     load_be32(data));
 		break;
 
+	case 0x4016:
+		if (attrlen != 2)
+			goto badlen;
+		i = load_be16(data);
+		udp_sockaddr(vpninfo, i);
+		vpn_progress(vpninfo, PRG_DEBUG, _("ESP port: %d\n"), i);
+		break;
+
+	case 0x4017:
+		if (attrlen != 4)
+			goto badlen;
+		vpninfo->esp_ssl_fallback = load_be32(data);
+		vpn_progress(vpninfo, PRG_DEBUG, _("ESP to SSL fallback: %u seconds\n"),
+			     vpninfo->esp_ssl_fallback);
+		break;
+
+	case 0x401a:
+		if (attrlen != 1)
+			goto badlen;
+		/* Amusingly, this isn't enforced. It's client-only */
+		vpn_progress(vpninfo, PRG_DEBUG, _("ESP only: %d\n"),
+			     data[0]);
+		break;
+#if 0
 	case GRP_ATTR(7, 1):
 		if (attrlen != 4)
 			goto badlen;
@@ -486,6 +455,19 @@ static int process_attr(struct openconnect_info *vpninfo, int group, int attr,
 		vpn_progress(vpninfo, PRG_DEBUG, _("%d bytes of ESP secrets\n"),
 			     attrlen);
 		break;
+#endif
+	/* 0x4022: disable proxy
+	   0x400a: preserve proxy
+	   0x4008: proxy (string)
+	   0x4000: disconnect when routes changed
+	   0x4015: tos copy
+	   0x4001:  tunnel routes take precedence
+	   0x401f:  tunnel routes with subnet access (also 4001 set)
+	   0x4020: Enforce IPv4
+	   0x4021: Enforce IPv6
+	   0x401e: Server IPv6 address
+	   0x000f: IPv6 netmask?
+	*/
 
 	default:
 		buf[0] = 0;
@@ -495,27 +477,11 @@ static int process_attr(struct openconnect_info *vpninfo, int group, int attr,
 			sprintf(buf + strlen(buf), "...");
 
 		vpn_progress(vpninfo, PRG_DEBUG,
-			     _("Unknown TLV group %d attr %d len %d:%s\n"),
-			       group, attr, attrlen, buf);
+			     _("Unknown attr 0x%x len %d:%s\n"),
+			     type, attrlen, buf);
 	}
 	return 0;
 }
-
-static void put_len16(struct oc_text_buf *buf, int where)
-{
-	int len = buf->pos - where;
-
-	store_be16(buf->data + where - 2, len);
-}
-
-static void put_len32(struct oc_text_buf *buf, int where)
-{
-	int len = buf->pos - where;
-
-	store_be32(buf->data + where - 4, len);
-}
-
-#endif
 
 static int recv_ift_packet(struct openconnect_info *vpninfo, void *buf, int len)
 {
@@ -527,6 +493,7 @@ static int recv_ift_packet(struct openconnect_info *vpninfo, void *buf, int len)
 	}
 	return ret;
 }
+
 static int send_ift_packet(struct openconnect_info *vpninfo, struct oc_text_buf *buf)
 {
 	int ret;
@@ -973,6 +940,10 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		if (!j2_found)
 			goto bad_eap;
 
+		vpn_progress(vpninfo, PRG_TRACE,
+			     _("Pulse password auth request, code 0x%02x\n"),
+			     j2_code);
+
 		/* Construct auth packet for response */
 		buf_truncate(reqbuf);
 		buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
@@ -1033,7 +1004,10 @@ int pulse_obtain_cookie(struct openconnect_info *vpninfo)
 
 int pulse_connect(struct openconnect_info *vpninfo)
 {
-	int ret = 0;
+	unsigned char bytes[16384];
+	int ret = 0, l;
+	unsigned char *p;
+	int routes_len = 0;
 
 	/* If we already have a channel open, it's because we have just
 	 * successfully authenticated on it from pulse_obtain_cookie(). */
@@ -1043,14 +1017,178 @@ int pulse_connect(struct openconnect_info *vpninfo)
 			return ret;
 	}
 
+	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
+	if (ret < 0)
+		return ret;
+
+
+	/* Example config packet:
+
+	   < 0000: 00 00 0a 4c 00 00 00 01  00 00 01 80 00 00 01 fb  |...L............|
+	   < 0010: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+	   < 0020: 2c 20 f0 00 00 00 00 00  00 00 01 70 2e 00 00 78  |, .........p...x|
+	   < 0030: 07 00 00 00 07 00 00 10  00 00 ff ff 05 05 00 00  |................|
+	   < 0040: 05 05 ff ff 07 00 00 10  00 00 ff ff 07 00 00 00  |................|
+	   < 0050: 07 00 00 ff 07 00 00 10  00 00 ff ff 08 08 08 08  |................|
+	   < 0060: 08 08 08 08 f1 00 00 10  00 00 ff ff 06 06 06 06  |................|
+	   < 0070: 06 06 06 07 f1 00 00 10  00 00 ff ff 09 09 09 09  |................|
+	   < 0080: 09 09 09 09 f1 00 00 10  00 00 ff ff 0a 0a 0a 0a  |................|
+	   < 0090: 0a 0a 0a 0a f1 00 00 10  00 00 ff ff 0b 0b 0b 0b  |................|
+	   < 00a0: 0b 0b 0b 0b 00 00 00 dc  03 00 00 00 40 00 00 01  |............@...|
+	   < 00b0: 00 40 01 00 01 00 40 1f  00 01 00 40 20 00 01 00  |.@....@....@ ...|
+	   < 00c0: 40 21 00 01 00 40 05 00  04 00 00 05 78 00 03 00  |@!...@......x...|
+	   < 00d0: 04 08 08 08 08 00 03 00  04 08 08 04 04 40 06 00  |.............@..|
+	   < 00e0: 0c 70 73 65 63 75 72 65  2e 6e 65 74 00 40 07 00  |.psecure.net.@..|
+	   < 00f0: 04 00 00 00 00 00 04 00  04 01 01 01 01 40 19 00  |.............@..|
+	   < 0100: 01 01 40 1a 00 01 00 40  0f 00 02 00 00 40 10 00  |..@....@.....@..|
+	   < 0110: 02 00 05 40 11 00 02 00  02 40 12 00 04 00 00 04  |...@.....@......|
+	   < 0120: b0 40 13 00 04 00 00 00  00 40 14 00 04 00 00 00  |.@.......@......|
+	   < 0130: 01 40 15 00 04 00 00 00  00 40 16 00 02 11 94 40  |.@.......@.....@|
+	   < 0140: 17 00 04 00 00 00 0f 40  18 00 04 00 00 00 3c 00  |.......@......<.|
+	   < 0150: 01 00 04 0a 14 03 01 00  02 00 04 ff ff ff ff 40  |...............@|
+	   < 0160: 0b 00 04 0a c8 c8 c8 40  0c 00 01 00 40 0d 00 01  |.......@....@...|
+	   < 0170: 00 40 0e 00 01 00 40 1b  00 01 00 40 1c 00 01 00  |.@....@....@....|
+
+	   It starts as an IF-T/TLS packet of type Juniper/1.
+
+	   Lots of zeroes at the start, and at 0x20 there is a distinctive 0x2c20f000
+	   signature which appears to be in all config packets.
+
+	   At 0x28 it has the payload length (0x10 less than the full IF-T length).
+	   0x2c is the start of the routing information. The 0x2e byte always
+	   seems to be there, and in this example 0x78 is the length of the
+	   routing information block. The number of entries is in byte 0x30.
+	   In the absence of IPv6 perhaps, the length at 0x2c seems always to be
+	   the number of entries (in 0x30) * 0x10 + 8.
+
+	   Routing entries are 0x10 bytes each, starting at 0x34. The ones starting
+	   with 0x07 are include, with 0xf1 are exclude. No idea what the following 7
+	   bytes 0f 00 00 10 00 00 ff ff mean; perhaps the 0010 is a length?
+	   IPv4 address is bytes 8-11 of each entry, and the netmask is bizarrely
+	   encoded in the final 4 bytes.
+
+	   After the routing inforamation (in this example at 0xa4) comes another
+	   length field, this time for the information elements which comprise
+	   the rest of the packet. Not sure what the 03 00 00 00 at 0xa8 means;
+	   it *could* be an element type 0x3000 with payload length zero but if it
+	   is, we don't know what it means. Following that, the elements all have
+	   two bytes of type followed by two bytes length, then their payload.
+
+	   There follows an attempt to parse the packet based on the above
+	   understanding. Having more examples, especially with IPv6 split includes
+	   and excludes, would be useful...
+	*/
+
+	if (ret < 0x50 ||
+	    /* IF-T/TLS header */
+	    load_be32(bytes) != VENDOR_JUNIPER ||
+	    load_be32(bytes + 4) != 1 ||
+	    load_be32(bytes + 8) != ret ||
+	    /* This appears to indicate the packet type (vs. EAP config) */
+	    load_be32(bytes + 0x20) != 0x2c20f000 ||
+	    /* A length field */
+	    load_be32(bytes + 0x28) != ret - 0x10 ||
+	    /* Start of routing information */
+	    load_be16(bytes + 0x2c) != 0x2e00 ||
+	    /* Routing length makes sense */
+	    (routes_len = load_be16(bytes + 0x2e)) != ((int)bytes[0x30] * 0x10 + 8) ||
+	    /* Make sure the next length field is actually present... */
+	    ret < 0x34 + 4 + routes_len ||
+	    /* Another length field (and maybe some adjacent zeroes) */
+	    load_be32(bytes + 0x2c + routes_len) + routes_len + 0x2c != ret) {
+	bad_config:
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Unexpected Pulse config packet:\n"));
+		dump_buf_hex(vpninfo, PRG_ERR, '<', (void *)bytes, ret);
+		return -EINVAL;
+	}
+	p = bytes + 0x34;
+	routes_len -= 8;
+	/* We know it's a multiple of 0x10 now. We checked. */
+	while (routes_len) {
+		char buf[80];
+		/* Probably not a whole be32 but let's see if anything ever changes */
+		uint32_t type = load_be32(p);
+		uint32_t ffff = load_be32(p+4);
+
+		if (ffff != 0xffff)
+			goto bad_config;
+
+		snprintf(buf, sizeof(buf), "%d.%d.%d.%d/%d.%d.%d.%d",
+			 p[8], p[9], p[10], p[11],
+			 255 ^ (p[8] ^ p[12]),  255 ^ (p[9] ^ p[13]),
+			 255 ^ (p[10] ^ p[14]),  255 ^ (p[11] ^ p[15]));
+		if (type == 0x07000010) {
+			struct oc_split_include *inc;
+
+			vpn_progress(vpninfo, PRG_DEBUG, _("Received split include route %s\n"), buf);
+			inc = malloc(sizeof(*inc));
+			if (inc) {
+				inc->route = add_option(vpninfo, "split-include", buf, -1);
+				if (inc->route) {
+					inc->next = vpninfo->ip_info.split_includes;
+					vpninfo->ip_info.split_includes = inc;
+				} else
+					free(inc);
+			}
+		} else if (type == 0xf1000010) {
+			struct oc_split_include *exc;
+
+			vpn_progress(vpninfo, PRG_DEBUG, _("Received split exclude route %s\n"), buf);
+			exc = malloc(sizeof(*exc));
+			if (exc) {
+				exc->route = add_option(vpninfo, "split-exclude", buf, -1);
+				if (exc->route) {
+					exc->next = vpninfo->ip_info.split_excludes;
+					vpninfo->ip_info.split_excludes = exc;
+				} else
+					free(exc);
+			}
+		} else
+			goto bad_config;
+
+		p += 0x10;
+		routes_len -= 0x10;
+	}
+
+	/* p now points at the length field of the final elements, which
+	   was already checked. */
+	l = load_be32(p);
+	/* No idea what this is */
+	if (l < 8 || load_be32(p + 4) != 0x03000000)
+		goto bad_config;
+	p += 8;
+	l -= 8;
+
+	while (l) {
+		uint16_t type = load_be16(p);
+		uint16_t len = load_be16(p+2);
+
+		if (len + 4 > l)
+			goto bad_config;
+
+		p += 4;
+		l -= 4;
+		process_attr(vpninfo, type, p, len);
+		p += len;
+		l -= len;
+		if (l && l < 4)
+			goto bad_config;
+	}
+
+	if (!vpninfo->ip_info.mtu ||
+	    (!vpninfo->ip_info.addr && !vpninfo->ip_info.addr6)) {
+		vpn_progress(vpninfo, PRG_ERR, "Insufficient configuration found\n");
+		goto bad_config;
+	}
+
+	ret = 0;
 	monitor_fd_new(vpninfo, ssl);
 	monitor_read_fd(vpninfo, ssl);
 	monitor_except_fd(vpninfo, ssl);
 
 	free(vpninfo->cstp_pkt);
 	vpninfo->cstp_pkt = NULL;
-
-	vpninfo->ip_info.mtu = 1400;
 
 	return ret;
 }
