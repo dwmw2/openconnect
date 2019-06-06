@@ -805,7 +805,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 	reqbuf = buf_alloc();
 
-	buf_append(reqbuf, "GET / HTTP/1.1\r\n");
+	buf_append(reqbuf, "GET /%s HTTP/1.1\r\n", vpninfo->urlpath ?: "");
 	http_common_headers(vpninfo, reqbuf);
 	buf_append(reqbuf, "Content-Type: EAP\r\n");
 	buf_append(reqbuf, "Upgrade: IF-T/TLS 1.0\r\n");
