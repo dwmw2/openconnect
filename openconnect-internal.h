@@ -521,6 +521,12 @@ struct openconnect_info {
 	struct oc_tpm2_ctx *tpm2;
 #endif
 #endif /* OPENCONNECT_GNUTLS */
+	struct oc_text_buf *ttls_pushbuf;
+	uint8_t ttls_eap_ident;
+	unsigned char *ttls_recvbuf;
+	int ttls_recvpos;
+	int ttls_recvlen;
+
 	struct pin_cache *pin_cache;
 	struct keepalive_info ssl_times;
 	int owe_ssl_dpd_response;
@@ -879,6 +885,9 @@ void pulse_common_headers(struct openconnect_info *vpninfo, struct oc_text_buf *
 int pulse_connect(struct openconnect_info *vpninfo);
 int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
 int pulse_bye(struct openconnect_info *vpninfo, const char *reason);
+int establish_eap_ttls(struct openconnect_info *vpninfo);
+int pulse_eap_ttls_send(struct openconnect_info *vpninfo, const void *data, int len);
+int pulse_eap_ttls_recv(struct openconnect_info *vpninfo, void *data, int len);
 
 /* auth-globalprotect.c */
 int gpst_obtain_cookie(struct openconnect_info *vpninfo);
@@ -1253,6 +1262,5 @@ static inline void store_le16(void *_p, uint16_t d)
 	p[3] = d >> 24;
 }
 #endif /* !Not known to be little-endian */
-int establish_eap_ttls(struct openconnect_info *vpninfo);
 
 #endif /* __OPENCONNECT_INTERNAL_H__ */

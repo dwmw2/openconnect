@@ -86,23 +86,15 @@ static void buf_append_be32(struct oc_text_buf *buf, uint32_t val)
 	buf_append_bytes(buf, b, 4);
 }
 
-static void buf_append_ift_hdr(struct oc_text_buf *buf, uint32_t vendor, uint32_t type, uint32_t seq)
+static void buf_append_ift_hdr(struct oc_text_buf *buf, uint32_t vendor, uint32_t type)
 {
 	uint32_t b[4];
 
 	store_be32(&b[0], vendor);
 	store_be32(&b[1], type);
 	b[2] = 0; /* Length will be filled in later. */
-	store_be32(&b[3], seq);
+	b[3] = 0;
 	buf_append_bytes(buf, b, 16);
-}
-
-/* If a buf contains an IF-T/TLS frame, fill in the length word
- * at offset 8 in its header, with the full length of the buf */
-static void buf_fill_ift_len(struct oc_text_buf *buf)
-{
-	if (!buf_error(buf) && buf->pos > 8)
-		store_be32(buf->data + 8, buf->pos);
 }
 
 /* Append EAP header, using VENDOR_JUNIPER and the given subtype if
@@ -503,7 +495,14 @@ static int send_ift_packet(struct openconnect_info *vpninfo, struct oc_text_buf 
 			     _("Error creating IF-T packet\n"));
 		return buf_error(buf);
 	}
-	buf_fill_ift_len(buf);
+
+	/* Fill in the length word in the header with the full length of the buffer.
+	 * Also populate the sequence number. */
+	if (!buf_error(buf) && buf->pos > 16) {
+		store_be32(buf->data + 8, buf->pos);
+		store_be32(buf->data + 12, vpninfo->ift_seq++);
+	}
+
 	dump_buf_hex(vpninfo, PRG_DEBUG, '>', (void *)buf->data, buf->pos);
 	ret = vpninfo->ssl_write(vpninfo, buf->data, buf->pos);
 	if (ret != buf->pos) {
@@ -840,7 +839,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	vpninfo->ift_seq = 0;
 	/* IF-T version request. */
 	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_VERSION_REQUEST, vpninfo->ift_seq++);
+	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_VERSION_REQUEST);
 	/* min=1, max=1, preferred version=1 */
 	buf_append_be32(reqbuf, 0x00010101);
 	ret = send_ift_packet(vpninfo, reqbuf);
@@ -865,7 +864,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 	/* Client information packet */
 	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_JUNIPER, 0x88, vpninfo->ift_seq++);
+	buf_append_ift_hdr(reqbuf, VENDOR_JUNIPER, 0x88);
 	buf_append(reqbuf, "clientHostName=%s", vpninfo->localname);
 	bytes[0] = 0;
 	if (vpninfo->peer_addr && vpninfo->peer_addr->sa_family == AF_INET6) {
@@ -902,7 +901,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 	/* Start by sending an EAP Identity of 'anonymous' */
 	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
+	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE);
 	buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
 	eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, 1, EAP_TYPE_IDENTITY, 0);
 	buf_append(reqbuf, "anonymous");
@@ -931,6 +930,12 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 	/* Check requested EAP type */
 	if (bytes[0x18] == EAP_TYPE_TTLS) {
+		vpninfo->ttls_eap_ident = eap_ident;
+		vpninfo->ttls_recvbuf = malloc(16384);
+		if (!vpninfo->ttls_recvbuf)
+			return -ENOMEM;
+		vpninfo->ttls_recvlen = 0;
+		vpninfo->ttls_recvpos = 0;
 		establish_eap_ttls(vpninfo);
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Certificate auth via EAP-TTLS not yet supported for Pulse\n"));
@@ -960,7 +965,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 	/* Present the auth cookie */
 	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
+	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE);
 	buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
 	eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, eap_ident, EAP_TYPE_EXPANDED, 1);
 
@@ -1045,7 +1050,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 	/* Prepare next response packet */
 	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
+	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE);
 	buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
 	eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, eap_ident, EAP_TYPE_EXPANDED, 1);
 
@@ -1123,8 +1128,98 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		openconnect_close_https(vpninfo, 0);
 
 	buf_free(reqbuf);
-
+	free(vpninfo->ttls_recvbuf);
+	vpninfo->ttls_recvbuf = NULL;
 	return ret;
+}
+
+int pulse_eap_ttls_send(struct openconnect_info *vpninfo, const void *data, int len)
+{
+	struct oc_text_buf *buf = vpninfo->ttls_pushbuf;
+
+	if (!buf) {
+		buf = vpninfo->ttls_pushbuf = buf_alloc();
+		if (!buf)
+			return -ENOMEM;
+	}
+
+	/* We concatenate sent data into a single EAP-TTLS frame which is
+	 * sent just before we actually need to read something. */
+	if (!buf->pos) {
+		buf_append_ift_hdr(buf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE);
+		buf_append_be32(buf, JUNIPER_1); /* IF-T/TLS Auth Type */
+		buf_append_eap_hdr(buf, EAP_RESPONSE, vpninfo->ttls_eap_ident,
+				   EAP_TYPE_TTLS, 0);
+		/* Flags byte for EAP-TTLS */
+		buf_append_bytes(buf, "\0", 1);
+	}
+	buf_append_bytes(buf, data, len);
+	return len;
+}
+
+int pulse_eap_ttls_recv(struct openconnect_info *vpninfo, void *data, int len)
+{
+	struct oc_text_buf *pushbuf= vpninfo->ttls_pushbuf;
+	int ret;
+
+	if (!vpninfo->ttls_recvlen) {
+		uint8_t flags;
+
+		if (pushbuf && !buf_error(pushbuf) && pushbuf->pos) {
+			buf_fill_eap_len(pushbuf, 0x14);
+			ret = send_ift_packet(vpninfo, pushbuf);
+			if (ret)
+				return ret;
+			buf_truncate(pushbuf);
+		} /* else send a continue? */
+
+		vpninfo->ttls_recvlen = vpninfo->ssl_read(vpninfo, (void *)vpninfo->ttls_recvbuf,
+							  16384);
+		if (vpninfo->ttls_recvlen > 0 && vpninfo->dump_http_traffic) {
+			vpn_progress(vpninfo, PRG_TRACE,
+				     _("Read %d bytes of IF-T/TLS EAP-TTLS record\n"),
+				     vpninfo->ttls_recvlen);
+			dump_buf_hex(vpninfo, PRG_TRACE, '<',
+				     (void *)vpninfo->ttls_recvbuf,
+				     vpninfo->ttls_recvlen);
+		}
+		if (!valid_ift_auth_eap(vpninfo->ttls_recvbuf, vpninfo->ttls_recvlen) ||
+		    vpninfo->ttls_recvlen < 0x1a ||
+		    vpninfo->ttls_recvbuf[0x18] != EAP_TYPE_TTLS) {
+		bad_pkt:
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Bad EAP-TTLS packet\n"));
+			return -EIO;
+		}
+		vpninfo->ttls_eap_ident = vpninfo->ttls_recvbuf[0x15];
+		flags = vpninfo->ttls_recvbuf[0x19];
+		if (flags & 0x7f)
+			goto bad_pkt;
+		if (flags & 0x80) {
+			/* Length bit. */
+			if (vpninfo->ttls_recvlen < 0x1e ||
+			    load_be32(vpninfo->ttls_recvbuf + 0x1a) != vpninfo->ttls_recvlen - 0x1e)
+				goto bad_pkt;
+			vpninfo->ttls_recvpos = 0x1e;
+			vpninfo->ttls_recvlen -= 0x1e;
+		} else {
+			vpninfo->ttls_recvpos = 0x1a;
+			vpninfo->ttls_recvlen -= 0x1a;
+		}
+	}
+
+	if (len > vpninfo->ttls_recvlen) {
+		memcpy(data, vpninfo->ttls_recvbuf + vpninfo->ttls_recvpos,
+		       vpninfo->ttls_recvlen);
+		len = vpninfo->ttls_recvlen;
+		vpninfo->ttls_recvlen = 0;
+		return len;
+	}
+	memcpy(data, vpninfo->ttls_recvbuf + vpninfo->ttls_recvpos, len);
+	vpninfo->ttls_recvpos += len;
+	vpninfo->ttls_recvlen -= len;
+	return len;
+
 }
 
 int pulse_obtain_cookie(struct openconnect_info *vpninfo)
@@ -1571,7 +1666,7 @@ int pulse_bye(struct openconnect_info *vpninfo, const char *reason)
 {
 	if (vpninfo->ssl_fd != -1) {
 		struct oc_text_buf *buf = buf_alloc();
-		buf_append_ift_hdr(buf, VENDOR_JUNIPER, 0x89, vpninfo->ift_seq++);
+		buf_append_ift_hdr(buf, VENDOR_JUNIPER, 0x89);
 		if (!buf_error(buf))
 			send_ift_packet(vpninfo, buf);
 		buf_free(buf);

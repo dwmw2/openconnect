@@ -2607,84 +2607,22 @@ static int ttls_pull_timeout_func(gnutls_transport_ptr_t t, unsigned int ms)
 	return 0;
 }
 
-static int eap_ident = 1;
-
-static char ttlsbuf[65536];
-static int ttlslen = 0;
-static int ttlsofs = 0;
-
-static struct oc_text_buf *pushbuf;
-static char ift_eap_hdr[30] = {
-	0x00, 0x00, 0x55, 0x97, 0x00, 0x00, 0x00, 0x06,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x0a, 0x4c, 0x01, 0x02, 0x02, 0x00, 0x00,
-	0x15, 0x80, 0x00, 0x00, 0x00, 0x00
-};
-
-
-
 static ssize_t ttls_pull_func(gnutls_transport_ptr_t t, void *buf, size_t len)
 {
-	struct openconnect_info *vpninfo = t;
-	char bytes[65536];
-	int ret;
-
-	vpn_progress(vpninfo, PRG_TRACE, _("ttls_pull_func %zd\n"), len);
-	if (!ttlslen) {
-		if (pushbuf && !buf_error(pushbuf) && pushbuf->pos) {
-			store_be32(&pushbuf->data[8], pushbuf->pos);
-			store_be16(&pushbuf->data[22], pushbuf->pos - 20);
-			store_be32(&pushbuf->data[26], pushbuf->pos - 30);
-
-			dump_buf_hex(vpninfo, PRG_DEBUG, '>', pushbuf->data, pushbuf->pos);
-			vpninfo->ssl_write(vpninfo, pushbuf->data, pushbuf->pos);
-			buf_truncate(pushbuf);
-			buf_append_bytes(pushbuf, ift_eap_hdr, sizeof(ift_eap_hdr));
-			ift_eap_hdr[21]++;
-		} /* else send a continue? */
-
-
-		ttlslen = vpninfo->ssl_read(vpninfo, ttlsbuf, sizeof(ttlsbuf));
-		if (ttlslen > 0 && vpninfo->dump_http_traffic) {
-			vpn_progress(vpninfo, PRG_TRACE,
-				     _("Read %d bytes of IF-T/TLS EAP-TTLS record\n"), ttlslen);
-			dump_buf_hex(vpninfo, PRG_TRACE, '<', ttlsbuf, ttlslen);
-		}
-		if (ttlslen < 30)
-			return -EIO;
-		ttlsofs = 30;
-		ttlslen -= 30;
-	}
-
-	if (len > ttlslen) {
-		memcpy(buf, ttlsbuf + ttlsofs, ttlslen);
-		printf ("Return %d of %zd\n", ttlslen, len);
-		len = ttlslen;
-		ttlslen = 0;
-		return len;
-	}
-	memcpy(buf, ttlsbuf + ttlsofs, len);
-	ttlsofs += len;
-	ttlslen -= len;
-	return len;
+	int ret = pulse_eap_ttls_recv(t, buf, len);
+	if (ret >= 0)
+		return ret;
+	else
+		return GNUTLS_E_PULL_ERROR;
 }
-
 
 static ssize_t ttls_push_func(gnutls_transport_ptr_t t, const void *buf, size_t len)
 {
-	struct openconnect_info *vpninfo = t;
-	int ret;
-
-	if (!pushbuf) {
-		pushbuf = buf_alloc();
-		buf_append_bytes(pushbuf, ift_eap_hdr, sizeof(ift_eap_hdr));
-		ift_eap_hdr[21]++;
-	}
-
-	vpn_progress(vpninfo, PRG_TRACE, _("ttls_push_func %zd\n"), len);
-
-	buf_append_bytes(pushbuf, buf, len);
-	return len;
+	int ret = pulse_eap_ttls_send(t, buf, len);
+	if (ret >= 0)
+		return ret;
+	else
+		return GNUTLS_E_PUSH_ERROR;
 }
 
 int establish_eap_ttls(struct openconnect_info *vpninfo)
