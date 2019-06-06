@@ -600,6 +600,113 @@ static int parse_avp(struct openconnect_info *vpninfo, void **pkt, int *pkt_len,
 }
 
 
+static int pulse_request_realm_entry(struct openconnect_info *vpninfo, struct oc_text_buf *reqbuf)
+{
+	struct oc_auth_form f;
+	struct oc_form_opt o;
+	int ret;
+
+	memset(&f, 0, sizeof(f));
+	memset(&o, 0, sizeof(o));
+        f.auth_id = (char *)"pulse_realm_entry";
+        f.opts = &o;
+
+	f.message = _("Enter Pulse user realm:");
+
+	o.next = NULL;
+	o.type = OC_FORM_OPT_TEXT;
+	o.name = (char *)"realm";
+	o.label = (char *)_("Realm:");
+
+	ret = process_auth_form(vpninfo, &f);
+	if (ret)
+		return ret;
+
+	if (o._value) {
+		buf_append_avp_string(reqbuf, 0xd50, o._value);
+		free_pass(&o._value);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct oc_text_buf *reqbuf,
+				      int realms, void *p, int l)
+{
+	uint8_t avp_flags;
+	uint32_t avp_code;
+	uint32_t avp_vendor;
+	int avp_len;
+	void *avp_p;
+	struct oc_auth_form f;
+	struct oc_form_opt_select o;
+	int i = 0, ret;
+
+	memset(&f, 0, sizeof(f));
+	memset(&o, 0, sizeof(o));
+	f.auth_id = (char *)"pulse_realm_choice";
+	f.opts = &o.form;
+	f.authgroup_opt = &o;
+	f.authgroup_selection = 1;
+	f.message = _("Choose Pulse user realm:");
+
+	o.form.next = NULL;
+	o.form.type = OC_FORM_OPT_SELECT;
+	o.form.name = (char *)"realm_choice";
+	o.form.label = (char *)_("Realm:");
+
+	o.nr_choices = realms;
+	o.choices = calloc(realms, sizeof(*o.choices));
+	if (!o.choices)
+		return -ENOMEM;
+
+	while (l) {
+		if (parse_avp(vpninfo, &p, &l, &avp_p, &avp_len, &avp_flags,
+			      &avp_vendor, &avp_code)) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Failed to parse AVP\n"));
+			ret = -EINVAL;
+			goto out;
+		}
+		if (avp_vendor != VENDOR_JUNIPER2 || avp_code != 0xd4e)
+			continue;
+
+		o.choices[i] = malloc(sizeof(struct oc_choice));
+		if (!o.choices[i]) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		o.choices[i]->name = o.choices[i]->label = strndup(avp_p, avp_len);
+		if (!o.choices[i]->name) {
+			ret = -ENOMEM;
+			goto out;
+		}
+
+		i++;
+	}
+
+
+	/* We don't need to do anything on group changes. */
+	do {
+		ret = process_auth_form(vpninfo, &f);
+	} while (ret == OC_FORM_RESULT_NEWGROUP);
+
+	if (!ret)
+		buf_append_avp_string(reqbuf, 0xd50, o.form._value);
+ out:
+	if (o.choices) {
+		for (i = 0; i < realms; i++) {
+			if (o.choices[i]) {
+				free(o.choices[i]->name);
+				free(o.choices[i]);
+			}
+		}
+		free(o.choices);
+	}
+	return ret;
+}
+
 static int pulse_request_user_auth(struct openconnect_info *vpninfo, struct oc_text_buf *reqbuf,
 				   uint8_t eap_ident)
 {
@@ -668,6 +775,7 @@ static int pulse_request_user_auth(struct openconnect_info *vpninfo, struct oc_t
 
 	return 0;
 }
+
 /* IF-T/TLS session establishment is the same for both pulse_obtain_cookie() and
  * pulse_connect(). We have to go through the EAP phase of the connection either
  * way; it's just that we might do it with just the cookie, or we might need to
@@ -685,7 +793,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	int avp_len, l;
 	void *avp_p, *p;
 	int cookie_found = 0;
-	int j2_found = 0;
+	int j2_found = 0, realms_found = 0, realm_entry = 0;
 	uint8_t j2_code = 0;
 
 	/* XXX: We should do what cstp_connect() does to check that configuration
@@ -869,7 +977,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 	/* Await start of auth negotiations */
  auth_response:
-	j2_found = 0;
+	realm_entry = realms_found = j2_found = 0;
 	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
 	if (ret < 0)
 		goto out;
@@ -907,6 +1015,10 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 				     _("Too many Pulse VPN sessions open\n"));
 			ret = -EPERM;
 			goto out;
+		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd4e) {
+			realms_found++;
+		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd4f) {
+			realm_entry++;
 		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd53) {
 			free(vpninfo->cookie);
 			vpninfo->cookie = strndup(avp_p, avp_len);
@@ -930,31 +1042,52 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 			goto bad_eap;
 	}
 
+	/* Prepare next response packet */
+	buf_truncate(reqbuf);
+	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
+	buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
+	eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, eap_ident, EAP_TYPE_EXPANDED, 1);
+
 	if (!cookie_found) {
+
+		/* No user interaction when called from pulse_connect().
+		 * We expect the cookie to work. */
 		if (connecting) {
 			vpn_progress(vpninfo, PRG_ERR,
 				     _("Pulse authentication cookie not accepted\n"));
 			ret = -EPERM;
 			goto out;
 		}
-		if (!j2_found)
+
+		if (realm_entry) {
+			vpn_progress(vpninfo, PRG_TRACE, _("Pulse realm entry\n"));
+
+			ret = pulse_request_realm_entry(vpninfo, reqbuf);
+			if (ret)
+				goto out;
+		} else if (realms_found) {
+			vpn_progress(vpninfo, PRG_TRACE, _("Pulse realm choice\n"));
+
+			ret = pulse_request_realm_choice(vpninfo, reqbuf, realms_found,
+							 bytes + 0x20, ret - 0x20);
+			if (ret)
+				goto out;
+		} else if (j2_found) {
+			vpn_progress(vpninfo, PRG_TRACE,
+				     _("Pulse password auth request, code 0x%02x\n"),
+				     j2_code);
+
+			/* Present user/password form to user */
+			ret = pulse_request_user_auth(vpninfo, reqbuf, eap2_ident);
+			if (ret)
+				goto out;
+		} else {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Unhandled Pulse auth request\n"));
 			goto bad_eap;
+		}
 
-		vpn_progress(vpninfo, PRG_TRACE,
-			     _("Pulse password auth request, code 0x%02x\n"),
-			     j2_code);
-
-		/* Construct auth packet for response */
-		buf_truncate(reqbuf);
-		buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
-		buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
-		eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, eap_ident, EAP_TYPE_EXPANDED, 1);
-
-		/* Present user/password form to user */
-		ret = pulse_request_user_auth(vpninfo, reqbuf, eap2_ident);
-		if (ret)
-			goto out;
-
+		/* If we get here, something has filled in the next response */
 		buf_fill_eap_len(reqbuf, eap_ofs);
 		ret = send_ift_packet(vpninfo, reqbuf);
 		if (ret)
@@ -966,10 +1099,6 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	/* We're done, but need to send an empty response to the above information
 	 * in order that the EAP session can complete with 'success'. Not quite
 	 * sure why they didn't send it as payload on the success frame, mind you. */
-	buf_truncate(reqbuf);
-	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE, vpninfo->ift_seq++);
-	buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
-	eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, bytes[0x15], EAP_TYPE_EXPANDED, 1);
 	buf_fill_eap_len(reqbuf, eap_ofs);
 	ret = send_ift_packet(vpninfo, reqbuf);
 	if (ret)
