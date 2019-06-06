@@ -509,6 +509,7 @@ struct openconnect_info {
 	SSL *https_ssl;
 #elif defined(OPENCONNECT_GNUTLS)
 	gnutls_session_t https_sess;
+	gnutls_session_t eap_ttls_sess;
 	gnutls_certificate_credentials_t https_cred;
 	gnutls_psk_client_credentials_t psk_cred;
 	char local_cert_md5[MD5_SIZE * 2 + 1]; /* For CSD */
@@ -1252,5 +1253,6 @@ static inline void store_le16(void *_p, uint16_t d)
 	p[3] = d >> 24;
 }
 #endif /* !Not known to be little-endian */
+int establish_eap_ttls(struct openconnect_info *vpninfo);
 
 #endif /* __OPENCONNECT_INTERNAL_H__ */

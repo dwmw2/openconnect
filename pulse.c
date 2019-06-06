@@ -931,6 +931,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 	/* Check requested EAP type */
 	if (bytes[0x18] == EAP_TYPE_TTLS) {
+		establish_eap_ttls(vpninfo);
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Certificate auth via EAP-TTLS not yet supported for Pulse\n"));
 		ret = -EINVAL;
