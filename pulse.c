@@ -1063,9 +1063,9 @@ int pulse_connect(struct openconnect_info *vpninfo)
 
 	   Routing entries are 0x10 bytes each, starting at 0x34. The ones starting
 	   with 0x07 are include, with 0xf1 are exclude. No idea what the following 7
-	   bytes 0f 00 00 10 00 00 ff ff mean; perhaps the 0010 is a length?
-	   IPv4 address is bytes 8-11 of each entry, and the netmask is bizarrely
-	   encoded in the final 4 bytes.
+	   bytes 0f 00 00 10 00 00 ff ff mean; perhaps the 0010 is a length? The IP
+	   address range is in bytes 8-11 (starting address) and the highest address
+	   of the range (traditionally a broadcast address) is in bytes 12-15.
 
 	   After the routing inforamation (in this example at 0xa4) comes another
 	   length field, this time for the information elements which comprise
@@ -1084,7 +1084,7 @@ int pulse_connect(struct openconnect_info *vpninfo)
 	    load_be32(bytes) != VENDOR_JUNIPER ||
 	    load_be32(bytes + 4) != 1 ||
 	    load_be32(bytes + 8) != ret ||
-	    /* This appears to indicate the packet type (vs. EAP config) */
+	    /* This appears to indicate the packet type (vs. ESP config) */
 	    load_be32(bytes + 0x20) != 0x2c20f000 ||
 	    /* A length field */
 	    load_be32(bytes + 0x28) != ret - 0x10 ||
@@ -1114,10 +1114,19 @@ int pulse_connect(struct openconnect_info *vpninfo)
 		if (ffff != 0xffff)
 			goto bad_config;
 
+		/* Convert the range end into a netmask by xor. Mask out the
+		 * bits in the network address, leaving only the low bits set,
+		 * then invert what's left so that only the high bits are set
+		 * as in a normal netmask.
+		 *
+		 * e.g.
+		 * 10.0.0.0-10.0.63.255 becomes 0.0.63.255 becomes 255.255.192.0
+		*/
 		snprintf(buf, sizeof(buf), "%d.%d.%d.%d/%d.%d.%d.%d",
 			 p[8], p[9], p[10], p[11],
 			 255 ^ (p[8] ^ p[12]),  255 ^ (p[9] ^ p[13]),
 			 255 ^ (p[10] ^ p[14]),  255 ^ (p[11] ^ p[15]));
+
 		if (type == 0x07000010) {
 			struct oc_split_include *inc;
 
