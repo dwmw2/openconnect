@@ -2709,9 +2709,18 @@ int establish_eap_ttls(struct openconnect_info *vpninfo)
 	printf("handshake err %d (%s)\n", err, gnutls_strerror(err));
 	if (!err) {
 		char foo[2048];
-		gnutls_record_send(ttls_sess, "hello", 5);
+		unsigned char bar[] = {
+			0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00,
+			0x02, 0x01, 0x00, 0x0e, 0x01, 'a', 'n', 'o',
+			'n',  'y',  'm',  'o',  'u',  's'
+		};
+		bar[7] = sizeof(bar);
+		gnutls_record_send(ttls_sess, bar, sizeof(bar));
 		err = gnutls_record_recv(ttls_sess, foo, 2048);
 		printf("recv err %d\n", err);
+		if (err > 0) {
+			dump_buf_hex(vpninfo, PRG_TRACE, '<', foo, err);
+		}
 	};
 	return err;
 }
