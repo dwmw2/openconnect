@@ -571,13 +571,17 @@ static int recv_eap_packet(struct openconnect_info *vpninfo, void *ttls, void *b
 		ret = TTLS_RECV(ttls, cbuf + 0xc, len - 0xc);
 		if (ret <= 8)
 			return -EIO;
-		if (load_be32(cbuf+0x0c) != AVP_CODE_EAP_MESSAGE ||
-		    load_be32(cbuf+0x10) != ret ||
-		    cbuf[0x11] != EAP_REQUEST ||
-		    load_be16(cbuf+0x12) != ret - 8) {
+		if (/* EAP-Message AVP */
+		    load_be32(cbuf+0x0c) != AVP_CODE_EAP_MESSAGE ||
+		    /* Ignore the mandatory bit */
+		    (load_be32(cbuf+0x10) & ~0x40000000) != ret ||
+		    cbuf[0x14] != EAP_REQUEST ||
+		    load_be16(cbuf+0x16) != ret - 8 ||
+		    load_be32(cbuf+0x18) != EXPANDED_JUNIPER ||
+		    load_be32(cbuf+0x1c) != 1) {
 			vpn_progress(vpninfo, PRG_ERR,
 				     _("Unexpected EAP-TTLS payload:\n"));
-			dump_buf_hex(vpninfo, PRG_ERR, '<', cbuf + 0xc, ret);
+			dump_buf_hex(vpninfo, PRG_ERR, '<', cbuf + 0x0c, ret);
 		}
 		return ret + 0xc;
 	}
@@ -930,7 +934,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	vpn_progress(vpninfo, PRG_TRACE, _("IF-T/TLS version from server: %d\n"),
 		     bytes[0x13]);
 
-	/* Client information packet */
+	/* Client information packet over IF-T/TLS */
 	buf_truncate(reqbuf);
 	buf_append_ift_hdr(reqbuf, VENDOR_JUNIPER, 0x88);
 	buf_append(reqbuf, "clientHostName=%s", vpninfo->localname);
@@ -958,7 +962,8 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	if (ret < 0)
 		goto out;
 
-	/* Basically an empty packet, without even an EAP header */
+	/* Basically an empty IF-T/TLS auth challenge packet of type Juniper/1,
+	 * without even an EAP header in the payload. */
 	if (!valid_ift_auth(bytes, ret) || ret != 0x14) {
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Unexpected IF-T/TLS authentication challenge:\n"));
@@ -967,7 +972,21 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		goto out;
 	}
 
-	/* Start by sending an EAP Identity of 'anonymous' */
+	/* Start by sending an EAP Identity of 'anonymous'. At this point we
+	 * aren't yet very far down the rabbithole...
+	 *
+	 *     --------------------------------------
+	 *     |                TCP/IP              |
+	 *     |------------------------------------|
+	 *     |                 TLS                |
+	 *     |------------------------------------|
+	 *     |               IF-T/TLS             |
+	 *     |------------------------------------|
+	 *     | EAP (IF-T/TLS Auth Type Juniper/1) |
+	 *     |------------------------------------|
+	 *     |             EAP-Identity           |
+         *     --------------------------------------
+	 */
 	buf_truncate(reqbuf);
 	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE);
 	buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
@@ -978,7 +997,30 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	if (ret)
 		goto out;
 
-	/* Noe the real negotiation starts */
+	/*
+	 * Phase 2 may continue directly with EAP within IF-T/TLS, or if certificate
+	 * auth is enabled, the server may use EAP-TTLS. In that case, we end up
+	 * with EAP within EAP-Message AVPs within EAP-TTLS within IF-T/TLS.
+	 * The send_eap_packet() and recv_eap_packet() functions cope with both
+	 * formats. The buffers have 0x14 bytes of header space, to allow for
+	 * the IF-T/TLS header which is the larger of the two.
+	 *
+	 *     --------------------------------------
+	 *     |                TCP/IP              |
+	 *     |------------------------------------|
+	 *     |                 TLS                |
+	 *     |------------------------------------|
+	 *     |               IF-T/TLS             |
+	 *     |------------------------------------|
+	 *     | EAP (IF-T/TLS Auth Type Juniper/1) |
+	 *     |------------------                  |
+	 *     |     EAP-TTLS    |                  |
+	 *     |-----------------|  (or directly)   |
+	 *     | EAP-Message AVP |                  |
+	 *     |-----------------|------------------|
+	 *     |            EAP-Juniper-1           |
+	 *     --------------------------------------
+	 */
 	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
 	if (ret < 0)
 		goto out;
@@ -993,17 +1035,18 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		goto out;
 	}
 
-	/* Need to include this in our response */
-	eap_ident = bytes[0x15];
-
-	/* Check for the thing we *do* support, which is EAP Expanded
-	 * with Vendor == Juniper, Type == 1. */
+	/*
+	 * We know the packet is valid at least down to the first layer of
+	 * EAP in the diagram above, directly within the IF-T/TLS Auth Type
+	 * of Juniper/1. Now, disambiguate between the two cases where the
+	 * diagram diverges. Is it EAP-TTLS or is it EAP-Juniper-1 directly?
+	 */
 	if (!valid_ift_auth_eap_exj1(bytes, ret)) {
 		/* If it isn't that, it'd better be EAP-TTLS... */
 		if (bytes[0x18] != EAP_TYPE_TTLS)
 			goto bad_eap;
 
-		vpninfo->ttls_eap_ident = eap_ident;
+		vpninfo->ttls_eap_ident = bytes[0x15];
 		vpninfo->ttls_recvbuf = malloc(16384);
 		if (!vpninfo->ttls_recvbuf)
 			return -ENOMEM;
@@ -1021,9 +1064,23 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		if (ret)
 			goto out;
 
+		/*
+		 * The recv_eap_packet() function receives and validates the EAP
+		 * packet of type Extended Juniper-1, either natively or within
+		 * EAP-TTLS according to whether 'ttls' is set.
+		 */
 		ret = recv_eap_packet(vpninfo, ttls, bytes, sizeof(bytes));
+		if (ret < 0)
+			goto out;
 	}
 
+	/* Now we (hopefully) have the server information packet, in an EAP request
+	 * from the server. Either it was received directly in IF-T/TLS, or within
+	 * an EAP-Message within EAP-TTLS. Either way, the EAP message we're
+	 * interested in will be at offset 0x14 in the packet, its header will
+	 * have been checked, and is Expanded Juniper/1, and its payload thus
+	 * starts at 0x20. And its length is sufficient that we won't underflow */
+	eap_ident = bytes[0x15];
 	p = bytes + 0x20;
 	l = ret - 0x20;
 
