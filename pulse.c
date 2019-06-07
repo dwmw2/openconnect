@@ -549,41 +549,46 @@ static int send_eap_packet(struct openconnect_info *vpninfo, void *ttls, struct 
 }
 
 
-static int recv_eap_packet(struct openconnect_info *vpninfo, void *ttls, void *buf, int len)
+/*
+ * Using the given buffer, receive and validate an EAP request of the
+ * Expanded Juniper/1 type, either natively over IF-T/TLS or by EAP-TTLS
+ * over IF-T/TLS. Return a pointer to the EAP header, with its length and
+ * type already validated.
+ */
+static void *recv_eap_packet(struct openconnect_info *vpninfo, void *ttls, void *buf, int len)
 {
+	unsigned char *cbuf = buf;
 	int ret;
+
 	if (!ttls) {
 		ret = recv_ift_packet(vpninfo, buf, len);
 		if (ret < 0)
-			return ret;
+			return NULL;
 		if (!valid_ift_auth_eap_exj1(buf, ret)) {
 			vpn_progress(vpninfo, PRG_ERR,
 				     _("Unexpected IF-T/TLS authentication challenge:\n"));
 			dump_buf_hex(vpninfo, PRG_ERR, '<', (void *)buf, ret);
-			return -EINVAL;
+			return NULL;
 		}
-		return ret;
+		return cbuf + 0x14;
 	} else {
-		unsigned char *cbuf = buf;
-
-		/* Load the EAP-Message AVP at an offset which means the EAP payload
-		 * ends up at the same place it would for plain IF-T/TLS. */
-		ret = TTLS_RECV(ttls, cbuf + 0xc, len - 0xc);
+		ret = TTLS_RECV(ttls, buf, len);
 		if (ret <= 8)
-			return -EIO;
+			return NULL;
 		if (/* EAP-Message AVP */
-		    load_be32(cbuf+0x0c) != AVP_CODE_EAP_MESSAGE ||
+		    load_be32(cbuf) != AVP_CODE_EAP_MESSAGE ||
 		    /* Ignore the mandatory bit */
-		    (load_be32(cbuf+0x10) & ~0x40000000) != ret ||
-		    cbuf[0x14] != EAP_REQUEST ||
-		    load_be16(cbuf+0x16) != ret - 8 ||
-		    load_be32(cbuf+0x18) != EXPANDED_JUNIPER ||
-		    load_be32(cbuf+0x1c) != 1) {
+		    (load_be32(cbuf+0x04) & ~0x40000000) != ret ||
+		    cbuf[0x08] != EAP_REQUEST ||
+		    load_be16(cbuf+0x0a) != ret - 8 ||
+		    load_be32(cbuf+0x0c) != EXPANDED_JUNIPER ||
+		    load_be32(cbuf+0x10) != 1) {
 			vpn_progress(vpninfo, PRG_ERR,
 				     _("Unexpected EAP-TTLS payload:\n"));
-			dump_buf_hex(vpninfo, PRG_ERR, '<', cbuf + 0x0c, ret);
+			dump_buf_hex(vpninfo, PRG_ERR, '<', buf, ret);
+			return NULL;
 		}
-		return ret + 0xc;
+		return cbuf + 0x08;
 	}
 }
 
@@ -862,6 +867,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	uint32_t avp_vendor;
 	int avp_len, l;
 	void *avp_p, *p;
+	unsigned char *eap;
 	int cookie_found = 0;
 	int j2_found = 0, realms_found = 0, realm_entry = 0;
 	uint8_t j2_code = 0;
@@ -985,7 +991,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	 *     | EAP (IF-T/TLS Auth Type Juniper/1) |
 	 *     |------------------------------------|
 	 *     |             EAP-Identity           |
-         *     --------------------------------------
+	 *     --------------------------------------
 	 */
 	buf_truncate(reqbuf);
 	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE);
@@ -1027,7 +1033,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 	/* Check EAP header and length */
 	if (!valid_ift_auth_eap(bytes, ret)) {
-	bad_eap:
+	bad_ift:
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Unexpected IF-T/TLS authentication challenge:\n"));
 		dump_buf_hex(vpninfo, PRG_ERR, '<', (void *)bytes, ret);
@@ -1041,10 +1047,12 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	 * of Juniper/1. Now, disambiguate between the two cases where the
 	 * diagram diverges. Is it EAP-TTLS or is it EAP-Juniper-1 directly?
 	 */
-	if (!valid_ift_auth_eap_exj1(bytes, ret)) {
+	if (valid_ift_auth_eap_exj1(bytes, ret)) {
+		eap = bytes + 0x14;
+	} else {
 		/* If it isn't that, it'd better be EAP-TTLS... */
 		if (bytes[0x18] != EAP_TYPE_TTLS)
-			goto bad_eap;
+			goto bad_ift;
 
 		vpninfo->ttls_eap_ident = bytes[0x15];
 		vpninfo->ttls_recvbuf = malloc(16384);
@@ -1069,9 +1077,11 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		 * packet of type Extended Juniper-1, either natively or within
 		 * EAP-TTLS according to whether 'ttls' is set.
 		 */
-		ret = recv_eap_packet(vpninfo, ttls, bytes, sizeof(bytes));
-		if (ret < 0)
+		eap = recv_eap_packet(vpninfo, ttls, bytes, sizeof(bytes));
+		if (!eap) {
+			ret = -EIO;
 			goto out;
+		}
 	}
 
 	/* Now we (hopefully) have the server information packet, in an EAP request
@@ -1080,29 +1090,33 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	 * interested in will be at offset 0x14 in the packet, its header will
 	 * have been checked, and is Expanded Juniper/1, and its payload thus
 	 * starts at 0x20. And its length is sufficient that we won't underflow */
-	eap_ident = bytes[0x15];
-	p = bytes + 0x20;
-	l = ret - 0x20;
+	eap_ident = eap[1];
+	l = load_be16(eap + 2) - 0x0c; /* Already validated */
+	p = eap + 0x0c;
 
 	/* We don't actually use anything we get here. Typically it
 	 * contains Juniper/0xd49 and Juniper/0xd4a word AVPs, and
 	 * a Juniper/0xd56 AVP with server licensing information. */
 	while (l) {
+		printf("p %02x %02x l %d\n", *(unsigned char *)p,
+		       ((unsigned char *)p)[1], l);
 		if (parse_avp(vpninfo, &p, &l, &avp_p, &avp_len, &avp_flags,
 			      &avp_vendor, &avp_code)) {
+		bad_eap:
 			vpn_progress(vpninfo, PRG_ERR,
 				     _("Failed to parse AVP\n"));
-			goto bad_eap;
+			dump_buf_hex(vpninfo, PRG_ERR, 'E', eap, load_be16(eap + 2));
+			ret = -EINVAL;
+			goto out;
 		}
 		dump_avp(vpninfo, avp_flags, avp_vendor, avp_code, avp_p, avp_len);
 	}
 
-	/* Present the auth cookie */
+	/* Present the client information and auth cookie */
 	buf_truncate(reqbuf);
 	buf_append_ift_hdr(reqbuf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE);
 	buf_append_be32(reqbuf, JUNIPER_1); /* IF-T/TLS Auth Type */
 	eap_ofs = buf_append_eap_hdr(reqbuf, EAP_RESPONSE, eap_ident, EAP_TYPE_EXPANDED, 1);
-
 	/* Their client sends a lot of other stuff here, which we don't
 	 * understand and which doesn't appear to be mandatory. So leave
 	 * it out for now until/unless it becomes necessary. */
@@ -1118,14 +1132,16 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	/* Await start of auth negotiations */
  auth_response:
 	realm_entry = realms_found = j2_found = 0;
-	ret = recv_eap_packet(vpninfo, ttls, (void *)bytes, sizeof(bytes));
-	if (ret < 0)
+	eap = recv_eap_packet(vpninfo, ttls, (void *)bytes, sizeof(bytes));
+	if (!eap) {
+		ret = -EIO;
 		goto out;
+	}
 
-	eap_ident = bytes[0x15];
+	eap_ident = eap[1];
+	l = load_be16(eap + 2) - 0x0c; /* Already validated */
+	p = eap + 0x0c;
 
-	p = bytes + 0x20;
-	l = ret - 0x20;
 	while (l) {
 		if (parse_avp(vpninfo, &p, &l, &avp_p, &avp_len, &avp_flags,
 			      &avp_vendor, &avp_code)) {
