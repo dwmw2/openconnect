@@ -783,7 +783,7 @@ static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct o
 }
 
 static int pulse_request_user_auth(struct openconnect_info *vpninfo, struct oc_text_buf *reqbuf,
-				   uint8_t eap_ident)
+				   uint8_t eap_ident, char *user_prompt, char *pass_prompt)
 {
 	struct oc_auth_form f;
 	struct oc_form_opt o[2];
@@ -799,15 +799,21 @@ static int pulse_request_user_auth(struct openconnect_info *vpninfo, struct oc_t
 	o[0].next = &o[1];
 	o[0].type = OC_FORM_OPT_TEXT;
 	o[0].name = (char *)"username";
-	o[0].label = (char *)_("Username:");
+	if (!user_prompt || asprintf(&o[0].label, "%s:", user_prompt) < 0) {
+		user_prompt = NULL;
+		o[0].label = (char *)_("Username:");
+	}
 
 	o[1].type = OC_FORM_OPT_PASSWORD;
 	o[1].name = (char *)"password";
-	o[1].label = (char *)_("Password:");
+	if (!pass_prompt || asprintf(&o[1].label, "%s:", pass_prompt) < 0) {
+		pass_prompt = NULL;
+		o[1].label = (char *)_("Password:");
+	}
 
 	ret = process_auth_form(vpninfo, &f);
 	if (ret)
-		return ret;
+		goto out;
 
 	if (o[0]._value) {
 		buf_append_avp_string(reqbuf, 0xd6d, o[0]._value);
@@ -847,8 +853,14 @@ static int pulse_request_user_auth(struct openconnect_info *vpninfo, struct oc_t
 		}
 		free_pass(&o[1]._value);
 	}
+	ret = 0;
+ out:
+	if (user_prompt)
+		free(o[0].label);
+	if (pass_prompt)
+		free(o[1].label);
 
-	return 0;
+	return ret;
 }
 
 /* IF-T/TLS session establishment is the same for both pulse_obtain_cookie() and
@@ -872,6 +884,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	int j2_found = 0, realms_found = 0, realm_entry = 0;
 	uint8_t j2_code = 0;
 	void *ttls = NULL;
+	char *user_prompt = NULL, *pass_prompt = NULL;
 
 	/* XXX: We should do what cstp_connect() does to check that configuration
 	   hasn't changed on a reconnect. */
@@ -1098,8 +1111,6 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	 * contains Juniper/0xd49 and Juniper/0xd4a word AVPs, and
 	 * a Juniper/0xd56 AVP with server licensing information. */
 	while (l) {
-		printf("p %02x %02x l %d\n", *(unsigned char *)p,
-		       ((unsigned char *)p)[1], l);
 		if (parse_avp(vpninfo, &p, &l, &avp_p, &avp_len, &avp_flags,
 			      &avp_vendor, &avp_code)) {
 		bad_eap:
@@ -1168,6 +1179,12 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 				     _("Too many Pulse VPN sessions open\n"));
 			ret = -EPERM;
 			goto out;
+		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd80) {
+			free(user_prompt);
+			user_prompt = strndup(avp_p, avp_len);
+		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd81) {
+			free(pass_prompt);
+			pass_prompt = strndup(avp_p, avp_len);
 		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd4e) {
 			realms_found++;
 		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd4f) {
@@ -1231,7 +1248,8 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 				     j2_code);
 
 			/* Present user/password form to user */
-			ret = pulse_request_user_auth(vpninfo, reqbuf, eap2_ident);
+			ret = pulse_request_user_auth(vpninfo, reqbuf, eap2_ident,
+						      user_prompt, pass_prompt);
 			if (ret)
 				goto out;
 		} else {
@@ -1282,6 +1300,8 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		destroy_eap_ttls(vpninfo, ttls);
 	free(vpninfo->ttls_recvbuf);
 	vpninfo->ttls_recvbuf = NULL;
+	free(user_prompt);
+	free(pass_prompt);
 	return ret;
 }
 
