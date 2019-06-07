@@ -1084,12 +1084,12 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	if (vpninfo->peer_addr && vpninfo->peer_addr->sa_family == AF_INET6) {
 		struct sockaddr_in6 a;
 		socklen_t l = sizeof(a);
-		if (!getsockname(vpninfo->ssl_fd, &a, &l))
+		if (!getsockname(vpninfo->ssl_fd, (void *)&a, &l))
 			inet_ntop(AF_INET6, &a.sin6_addr, (void *)bytes, sizeof(bytes));
 	} else if (vpninfo->peer_addr && vpninfo->peer_addr->sa_family == AF_INET) {
 		struct sockaddr_in a;
 		socklen_t l = sizeof(a);
-		if (!getsockname(vpninfo->ssl_fd, &a, &l))
+		if (!getsockname(vpninfo->ssl_fd, (void *)&a, &l))
 			inet_ntop(AF_INET, &a.sin_addr, (void *)bytes, sizeof(bytes));
 	}
 	if (bytes[0])
