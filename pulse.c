@@ -707,7 +707,7 @@ static int pulse_request_realm_entry(struct openconnect_info *vpninfo, struct oc
 }
 
 static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct oc_text_buf *reqbuf,
-				      int realms, void *p, int l)
+				      int realms, unsigned char *eap)
 {
 	uint8_t avp_flags;
 	uint32_t avp_code;
@@ -717,6 +717,11 @@ static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct o
 	struct oc_auth_form f;
 	struct oc_form_opt_select o;
 	int i = 0, ret;
+	void *p;
+	int l;
+
+	l = load_be16(eap + 2) - 0x0c; /* Already validated */
+	p = eap + 0x0c;
 
 	memset(&f, 0, sizeof(f));
 	memset(&o, 0, sizeof(o));
@@ -779,6 +784,124 @@ static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct o
 		}
 		free(o.choices);
 	}
+	return ret;
+}
+
+static int pulse_request_session_kill(struct openconnect_info *vpninfo, struct oc_text_buf *reqbuf,
+				      int sessions, unsigned char *eap)
+{
+	uint8_t avp_flags;
+	uint32_t avp_code;
+	uint32_t avp_vendor;
+	int avp_len, avp_len2;
+	void *avp_p, *avp_p2;
+	struct oc_auth_form f;
+	struct oc_form_opt_select o;
+	int i = 0, ret;
+	void *p;
+	int l;
+	struct oc_text_buf *form_msg = buf_alloc();
+	char tmbuf[80];
+	struct tm tm;
+
+	l = load_be16(eap + 2) - 0x0c; /* Already validated */
+	p = eap + 0x0c;
+
+	memset(&f, 0, sizeof(f));
+	memset(&o, 0, sizeof(o));
+	f.auth_id = (char *)"pulse_session_kill";
+	f.opts = &o.form;
+
+	buf_append(form_msg, _("Session limit reached. Choose session to kill:\n"));
+
+	o.form.next = NULL;
+	o.form.type = OC_FORM_OPT_SELECT;
+	o.form.name = (char *)"session_choice";
+	o.form.label = (char *)_("Session:");
+
+	o.nr_choices = sessions;
+	o.choices = calloc(sessions, sizeof(*o.choices));
+	if (!o.choices)
+		return -ENOMEM;
+
+	while (l) {
+		char *from = NULL;
+		time_t when = 0;
+		char *sessid = NULL;
+
+		if (parse_avp(vpninfo, &p, &l, &avp_p, &avp_len, &avp_flags,
+			      &avp_vendor, &avp_code)) {
+		badlist:
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Failed to parse session list\n"));
+			ret = -EINVAL;
+			goto out;
+		}
+
+		if (avp_vendor != VENDOR_JUNIPER2 || avp_code != 0xd65)
+			continue;
+
+		while (avp_len) {
+			if (parse_avp(vpninfo, &avp_p, &avp_len, &avp_p2, &avp_len2,
+				      &avp_flags, &avp_vendor, &avp_code))
+				goto badlist;
+
+			dump_avp(vpninfo, avp_flags, avp_vendor, avp_code, avp_p2, avp_len2);
+
+			if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd66) {
+				sessid = strndup(avp_p2, avp_len2);
+			} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd67) {
+				from = strndup(avp_p2, avp_len2);
+			} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd68 &&
+				   avp_len2 == 8) {
+				when = load_be32((char *)avp_p2 + 4);
+				if (sizeof(time_t) > 4)
+					when |= ((uint64_t)load_be32(avp_p2)) << 32;
+			}
+		}
+
+		if (!from || !sessid || !when) {
+			free(from);
+			free(sessid);
+			goto badlist;
+		}
+
+		localtime_r(&when, &tm);
+		strftime(tmbuf, 80, "%a, %d %b %Y %H:%M:%S %Z", &tm);
+		buf_append(form_msg, " - %s from %s at %s\n", sessid, from, tmbuf);
+		free(from);
+		o.choices[i] = malloc(sizeof(struct oc_choice));
+		if (!o.choices[i]) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		o.choices[i]->name = o.choices[i]->label = sessid;
+		if (!o.choices[i]->name) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		i++;
+	}
+	ret = buf_error(form_msg);
+	if (ret)
+		goto out;
+
+	f.message = form_msg->data;
+
+	ret = process_auth_form(vpninfo, &f);
+	if (!ret)
+		buf_append_avp_string(reqbuf, 0xd69, o.form._value);
+ out:
+	if (o.choices) {
+		for (i = 0; i < sessions; i++) {
+			if (o.choices[i]) {
+				free(o.choices[i]->name);
+				free(o.choices[i]);
+			}
+		}
+		free(o.choices);
+	}
+	buf_free(form_msg);
 	return ret;
 }
 
@@ -881,7 +1004,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	void *avp_p, *p;
 	unsigned char *eap;
 	int cookie_found = 0;
-	int j2_found = 0, realms_found = 0, realm_entry = 0;
+	int j2_found = 0, realms_found = 0, realm_entry = 0, old_sessions = 0;
 	uint8_t j2_code = 0;
 	void *ttls = NULL;
 	char *user_prompt = NULL, *pass_prompt = NULL;
@@ -1113,9 +1236,9 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	while (l) {
 		if (parse_avp(vpninfo, &p, &l, &avp_p, &avp_len, &avp_flags,
 			      &avp_vendor, &avp_code)) {
-		bad_eap:
 			vpn_progress(vpninfo, PRG_ERR,
 				     _("Failed to parse AVP\n"));
+		bad_eap:
 			dump_buf_hex(vpninfo, PRG_ERR, 'E', eap, load_be16(eap + 2));
 			ret = -EINVAL;
 			goto out;
@@ -1142,7 +1265,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 	/* Await start of auth negotiations */
  auth_response:
-	realm_entry = realms_found = j2_found = 0;
+	realm_entry = realms_found = j2_found = old_sessions = 0;
 	eap = recv_eap_packet(vpninfo, ttls, (void *)bytes, sizeof(bytes));
 	if (!eap) {
 		ret = -EIO;
@@ -1175,10 +1298,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 			}
 		}
 		if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd65) {
-			vpn_progress(vpninfo, PRG_ERR,
-				     _("Too many Pulse VPN sessions open\n"));
-			ret = -EPERM;
-			goto out;
+			old_sessions++;
 		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd80) {
 			free(user_prompt);
 			user_prompt = strndup(avp_p, avp_len);
@@ -1203,13 +1323,21 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 			    load_be16(avp_c + 2) != avp_len ||
 			    load_be32(avp_c + 4) != EXPANDED_JUNIPER ||
 			    load_be32(avp_c + 8) != 2)
-				goto bad_eap;
+				goto auth_unknown;
 
 			j2_found = 1;
 			j2_code = avp_c[12];
 			eap2_ident = avp_c[1];
 		} else if (avp_flags & AVP_MANDATORY)
-			goto bad_eap;
+			goto auth_unknown;
+	}
+
+	/* We want it to be precisely one type of request, not a mixture. */
+	if (realm_entry + !!realms_found + j2_found + cookie_found + !!old_sessions != 1) {
+	auth_unknown:
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Unhandled Pulse authenticationb packet, or authentication failure\n"));
+		goto bad_eap;
 	}
 
 	/* Prepare next response packet */
@@ -1238,8 +1366,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		} else if (realms_found) {
 			vpn_progress(vpninfo, PRG_TRACE, _("Pulse realm choice\n"));
 
-			ret = pulse_request_realm_choice(vpninfo, reqbuf, realms_found,
-							 bytes + 0x20, ret - 0x20);
+			ret = pulse_request_realm_choice(vpninfo, reqbuf, realms_found, eap);
 			if (ret)
 				goto out;
 		} else if (j2_found) {
@@ -1250,6 +1377,13 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 			/* Present user/password form to user */
 			ret = pulse_request_user_auth(vpninfo, reqbuf, eap2_ident,
 						      user_prompt, pass_prompt);
+			if (ret)
+				goto out;
+		} else if (old_sessions) {
+			vpn_progress(vpninfo, PRG_TRACE,
+				     _("Pulse session limit, %d sessions\n"),
+				     old_sessions);
+			ret = pulse_request_session_kill(vpninfo, reqbuf, old_sessions, eap);
 			if (ret)
 				goto out;
 		} else {
@@ -1276,8 +1410,15 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		goto out;
 
 	if (ttls) {
+		/* Normally we don't actually send the EAP-TTLS frame until
+		 * we're waiting for a response, which allows us to coalesce.
+		 * This time, we need to flush the outbound frames. The empty
+		 * EAP response (within EAP-TTLS) causes the server to close
+		 * the EAP-TTLS session and the next response is plain IF-T/TLS
+		 * IFT_CLIENT_AUTH_SUCCESS just like the non-certificate mode. */
 		pulse_eap_ttls_recv(vpninfo, NULL, 0);
 	}
+
 	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
 	if (ret < 0)
 		goto out;
