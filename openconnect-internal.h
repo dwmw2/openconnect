@@ -846,6 +846,9 @@ int dtls_try_handshake(struct openconnect_info *vpninfo);
 unsigned dtls_set_mtu(struct openconnect_info *vpninfo, unsigned mtu);
 void dtls_ssl_free(struct openconnect_info *vpninfo);
 
+void *establish_eap_ttls(struct openconnect_info *vpninfo);
+void destroy_eap_ttls(struct openconnect_info *vpninfo, void *sess);
+
 /* dtls.c */
 int dtls_setup(struct openconnect_info *vpninfo, int dtls_attempt_period);
 int dtls_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
@@ -885,7 +888,6 @@ void pulse_common_headers(struct openconnect_info *vpninfo, struct oc_text_buf *
 int pulse_connect(struct openconnect_info *vpninfo);
 int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
 int pulse_bye(struct openconnect_info *vpninfo, const char *reason);
-int establish_eap_ttls(struct openconnect_info *vpninfo);
 int pulse_eap_ttls_send(struct openconnect_info *vpninfo, const void *data, int len);
 int pulse_eap_ttls_recv(struct openconnect_info *vpninfo, void *data, int len);
 

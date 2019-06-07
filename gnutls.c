@@ -2625,7 +2625,7 @@ static ssize_t ttls_push_func(gnutls_transport_ptr_t t, const void *buf, size_t 
 		return GNUTLS_E_PUSH_ERROR;
 }
 
-int establish_eap_ttls(struct openconnect_info *vpninfo)
+void *establish_eap_ttls(struct openconnect_info *vpninfo)
 {
 	gnutls_session_t ttls_sess = NULL;
 	int err;
@@ -2639,26 +2639,21 @@ int establish_eap_ttls(struct openconnect_info *vpninfo)
 	gnutls_transport_set_pull_timeout_function(ttls_sess, ttls_pull_timeout_func);
 
 	gnutls_credentials_set(ttls_sess, GNUTLS_CRD_CERTIFICATE, vpninfo->https_cred);
-	
+
 	err = gnutls_priority_set_direct(ttls_sess,
 				   vpninfo->gnutls_prio, NULL);
-	printf("set prio %s: %d\n", vpninfo->gnutls_prio, err);
+
 	err = gnutls_handshake(ttls_sess);
-	printf("handshake err %d (%s)\n", err, gnutls_strerror(err));
 	if (!err) {
-		char foo[2048];
-		unsigned char bar[] = {
-			0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00,
-			0x02, 0x01, 0x00, 0x0e, 0x01, 'a', 'n', 'o',
-			'n',  'y',  'm',  'o',  'u',  's'
-		};
-		bar[7] = sizeof(bar);
-		gnutls_record_send(ttls_sess, bar, sizeof(bar));
-		err = gnutls_record_recv(ttls_sess, foo, 2048);
-		printf("recv err %d\n", err);
-		if (err > 0) {
-			dump_buf_hex(vpninfo, PRG_TRACE, '<', foo, err);
-		}
-	};
-	return err;
+		vpn_progress(vpninfo, PRG_TRACE,
+			     _("Established EAP-TTLS session\n"));
+		return ttls_sess;
+	}
+	gnutls_deinit(ttls_sess);
+	return NULL;
+}
+
+void destroy_eap_ttls(struct openconnect_info *vpninfo, void *sess)
+{
+	gnutls_deinit(sess);
 }

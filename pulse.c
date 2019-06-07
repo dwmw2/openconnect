@@ -34,6 +34,8 @@
 #include <stdarg.h>
 #include <sys/types.h>
 
+#include "openconnect-internal.h"
+
 #define VENDOR_JUNIPER 0xa4c
 #define VENDOR_JUNIPER2 0x583
 #define VENDOR_TCG 0x5597
@@ -66,7 +68,13 @@
 
 #define AVP_CODE_EAP_MESSAGE 79
 
-#include "openconnect-internal.h"
+#if defined(OPENCONNECT_OPENSSL)
+#define TTLS_SEND SSL_write
+#define TTLS_RECV SSL_read
+#elif defined(OPENCONNECT_GNUTLS)
+#define TTLS_SEND gnutls_record_send
+#define TTLS_RECV gnutls_record_recv
+#endif
 
 static void buf_append_be16(struct oc_text_buf *buf, uint16_t val)
 {
@@ -490,7 +498,7 @@ static int send_ift_packet(struct openconnect_info *vpninfo, struct oc_text_buf 
 {
 	int ret;
 
-	if (buf_error(buf)) {
+	if (buf_error(buf) || buf->pos < 16) {
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Error creating IF-T packet\n"));
 		return buf_error(buf);
@@ -498,10 +506,8 @@ static int send_ift_packet(struct openconnect_info *vpninfo, struct oc_text_buf 
 
 	/* Fill in the length word in the header with the full length of the buffer.
 	 * Also populate the sequence number. */
-	if (!buf_error(buf) && buf->pos > 16) {
-		store_be32(buf->data + 8, buf->pos);
-		store_be32(buf->data + 12, vpninfo->ift_seq++);
-	}
+	store_be32(buf->data + 8, buf->pos);
+	store_be32(buf->data + 12, vpninfo->ift_seq++);
 
 	dump_buf_hex(vpninfo, PRG_DEBUG, '>', (void *)buf->data, buf->pos);
 	ret = vpninfo->ssl_write(vpninfo, buf->data, buf->pos);
@@ -514,6 +520,67 @@ static int send_ift_packet(struct openconnect_info *vpninfo, struct oc_text_buf 
 		return ret;
 	}
 	return 0;
+}
+
+/* We create packets with IF-T/TLS headers prepended because that's the
+ * larger header. In the case where they need to be sent over EAP-TTLS,
+ * convert the header to the EAP-Message AVP instead. */
+static int send_eap_packet(struct openconnect_info *vpninfo, void *ttls, struct oc_text_buf *buf)
+{
+	int ret;
+
+	if (buf_error(buf) || buf->pos < 16) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Error creating EAP packet\n"));
+		return buf_error(buf);
+	}
+
+	if (!ttls)
+		return send_ift_packet(vpninfo, buf);
+
+	/* AVP EAP-Message header */
+	store_be32(buf->data + 0x0c, AVP_CODE_EAP_MESSAGE);
+	store_be32(buf->data + 0x10, buf->pos - 0xc);
+	dump_buf_hex(vpninfo, PRG_DEBUG, '.', (void *)(buf->data + 0x0c), buf->pos - 0x0c);
+	ret = TTLS_SEND(ttls, buf->data + 0x0c, buf->pos - 0x0c);
+	if (ret != buf->pos - 0x0c)
+		return -EIO;
+	return 0;
+}
+
+
+static int recv_eap_packet(struct openconnect_info *vpninfo, void *ttls, void *buf, int len)
+{
+	int ret;
+	if (!ttls) {
+		ret = recv_ift_packet(vpninfo, buf, len);
+		if (ret < 0)
+			return ret;
+		if (!valid_ift_auth_eap_exj1(buf, ret)) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Unexpected IF-T/TLS authentication challenge:\n"));
+			dump_buf_hex(vpninfo, PRG_ERR, '<', (void *)buf, ret);
+			return -EINVAL;
+		}
+		return ret;
+	} else {
+		unsigned char *cbuf = buf;
+
+		/* Load the EAP-Message AVP at an offset which means the EAP payload
+		 * ends up at the same place it would for plain IF-T/TLS. */
+		ret = TTLS_RECV(ttls, cbuf + 0xc, len - 0xc);
+		if (ret <= 8)
+			return -EIO;
+		if (load_be32(cbuf+0x0c) != AVP_CODE_EAP_MESSAGE ||
+		    load_be32(cbuf+0x10) != ret ||
+		    cbuf[0x11] != EAP_REQUEST ||
+		    load_be16(cbuf+0x12) != ret - 8) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Unexpected EAP-TTLS payload:\n"));
+			dump_buf_hex(vpninfo, PRG_ERR, '<', cbuf + 0xc, ret);
+		}
+		return ret + 0xc;
+	}
 }
 
 static void dump_avp(struct openconnect_info *vpninfo, uint8_t flags,
@@ -794,6 +861,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	int cookie_found = 0;
 	int j2_found = 0, realms_found = 0, realm_entry = 0;
 	uint8_t j2_code = 0;
+	void *ttls = NULL;
 
 	/* XXX: We should do what cstp_connect() does to check that configuration
 	   hasn't changed on a reconnect. */
@@ -928,31 +996,40 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	/* Need to include this in our response */
 	eap_ident = bytes[0x15];
 
-	/* Check requested EAP type */
-	if (bytes[0x18] == EAP_TYPE_TTLS) {
+	/* Check for the thing we *do* support, which is EAP Expanded
+	 * with Vendor == Juniper, Type == 1. */
+	if (!valid_ift_auth_eap_exj1(bytes, ret)) {
+		/* If it isn't that, it'd better be EAP-TTLS... */
+		if (bytes[0x18] != EAP_TYPE_TTLS)
+			goto bad_eap;
+
 		vpninfo->ttls_eap_ident = eap_ident;
 		vpninfo->ttls_recvbuf = malloc(16384);
 		if (!vpninfo->ttls_recvbuf)
 			return -ENOMEM;
 		vpninfo->ttls_recvlen = 0;
 		vpninfo->ttls_recvpos = 0;
-		establish_eap_ttls(vpninfo);
-		vpn_progress(vpninfo, PRG_ERR,
-			     _("Certificate auth via EAP-TTLS not yet supported for Pulse\n"));
-		ret = -EINVAL;
-		goto out;
+		ttls = establish_eap_ttls(vpninfo);
+		if (!ttls) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Failed to establish EAP-TTLS session\n"));
+			ret = -EINVAL;
+			goto out;
+		}
+		/* Resend the EAP Identity 'anonymous' packet within EAP-TTLS */
+		ret = send_eap_packet(vpninfo, ttls, reqbuf);
+		if (ret)
+			goto out;
+
+		ret = recv_eap_packet(vpninfo, ttls, bytes, sizeof(bytes));
 	}
 
-	/* Check for the thing we *do* support, which is EAP Expanded
-	 * with Vendor == Juniper, Type == 1. */
-	if (!valid_ift_auth_eap_exj1(bytes, ret))
-		goto bad_eap;
+	p = bytes + 0x20;
+	l = ret - 0x20;
 
 	/* We don't actually use anything we get here. Typically it
 	 * contains Juniper/0xd49 and Juniper/0xd4a word AVPs, and
 	 * a Juniper/0xd56 AVP with server licensing information. */
-	p = bytes + 0x20;
-	l = ret - 0x20;
 	while (l) {
 		if (parse_avp(vpninfo, &p, &l, &avp_p, &avp_len, &avp_flags,
 			      &avp_vendor, &avp_code)) {
@@ -976,7 +1053,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	if (vpninfo->cookie)
 		buf_append_avp_string(reqbuf, 0xd53, vpninfo->cookie);
 	buf_fill_eap_len(reqbuf, eap_ofs);
-	ret = send_ift_packet(vpninfo, reqbuf);
+	ret = send_eap_packet(vpninfo, ttls, reqbuf);
 	if (ret)
 		goto out;
 
@@ -984,12 +1061,9 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	/* Await start of auth negotiations */
  auth_response:
 	realm_entry = realms_found = j2_found = 0;
-	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
+	ret = recv_eap_packet(vpninfo, ttls, (void *)bytes, sizeof(bytes));
 	if (ret < 0)
 		goto out;
-
-	if (!valid_ift_auth_eap_exj1(bytes, ret))
-		goto bad_eap;
 
 	eap_ident = bytes[0x15];
 
@@ -1095,7 +1169,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 
 		/* If we get here, something has filled in the next response */
 		buf_fill_eap_len(reqbuf, eap_ofs);
-		ret = send_ift_packet(vpninfo, reqbuf);
+		ret = send_eap_packet(vpninfo, ttls, reqbuf);
 		if (ret)
 			goto out;
 
@@ -1106,10 +1180,13 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	 * in order that the EAP session can complete with 'success'. Not quite
 	 * sure why they didn't send it as payload on the success frame, mind you. */
 	buf_fill_eap_len(reqbuf, eap_ofs);
-	ret = send_ift_packet(vpninfo, reqbuf);
+	ret = send_eap_packet(vpninfo, ttls, reqbuf);
 	if (ret)
 		goto out;
 
+	if (ttls) {
+		pulse_eap_ttls_recv(vpninfo, NULL, 0);
+	}
 	ret = recv_ift_packet(vpninfo, (void *)bytes, sizeof(bytes));
 	if (ret < 0)
 		goto out;
@@ -1128,6 +1205,8 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		openconnect_close_https(vpninfo, 0);
 
 	buf_free(reqbuf);
+	if (ttls)
+		destroy_eap_ttls(vpninfo, ttls);
 	free(vpninfo->ttls_recvbuf);
 	vpninfo->ttls_recvbuf = NULL;
 	return ret;
@@ -1172,6 +1251,8 @@ int pulse_eap_ttls_recv(struct openconnect_info *vpninfo, void *data, int len)
 				return ret;
 			buf_truncate(pushbuf);
 		} /* else send a continue? */
+		if (!len)
+			return 0;
 
 		vpninfo->ttls_recvlen = vpninfo->ssl_read(vpninfo, (void *)vpninfo->ttls_recvbuf,
 							  16384);
