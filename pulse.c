@@ -1439,6 +1439,8 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	buf_free(reqbuf);
 	if (ttls)
 		destroy_eap_ttls(vpninfo, ttls);
+	buf_free(vpninfo->ttls_pushbuf);
+	vpninfo->ttls_pushbuf = NULL;
 	free(vpninfo->ttls_recvbuf);
 	vpninfo->ttls_recvbuf = NULL;
 	free(user_prompt);
