@@ -507,6 +507,7 @@ struct openconnect_info {
 	X509 *cert_x509;
 	SSL_CTX *https_ctx;
 	SSL *https_ssl;
+	BIO_METHOD *ttls_bio_meth;
 #elif defined(OPENCONNECT_GNUTLS)
 	gnutls_session_t https_sess;
 	gnutls_session_t eap_ttls_sess;
