@@ -1,0 +1,22 @@
+env:
+  global:
+   # The next declaration is the encrypted COVERITY_SCAN_TOKEN, created
+   #   via the "travis encrypt" command using the project repo's public key
+   - secure: "LglRfGDW25GRcyqpNN4ZQlc2ODUvQAbS3mwP7GfNr9TRjfJTkgdfAbAKfKsbSRS76lAGN5qKjytGywlgSuu5O7NIb4CGVsB2VfKj1CRJk5QcnbmqJ3m53zUC2Mn4g0X4QvQo0koRV1fWtRRV23gSjFQhji38Pb0tt7htadqyX+0BlD/QLr+zyFLIHhjOZiJlAZ3sJZzJ/oL9RTJ1yZmGtUUgT3ItZiVBp+e9u4jnhzX2Px39ypWtzj1QuNJoepm5tzqGARlNB3QwZUU0oIxtN8M/lTScx1YgBQqS/CTJ0+mJ+NT7XI/p90wD6Qz4MycH6iQlE+lYkjaS0UY0tBsI/eszwcOQZ1BToX2OM+bTi0P3DpAc6IEq8ACzdkrXMIzz1uCpeVl0N3xJzr3HA4nh9UzS52cHmuocaXsR+NU9ucd0dZ9ljn3r/8JOcDtORfT+CKofKdtiv5PumlzVPpby9c73iItHNfnAVR7mYl2El/c9q3TU80083vOgEOxuWBX3uYxpTpELD186il3LejGyGg+6IIJxcJl5o+ZTavLoTvb/fm+f3XLJOPJLWm96SudlWk5qBnT6aDmaeuiEASA5VCdZrB7SjAaKj9qhOmDoJOwdWE57QMvKdVPQn0KZy1/UsEY1lVAkBndRlETAjLKywcwvzgQ/GInyy8bfbpgGYYU="
+
+before_install:
+  - echo -n | openssl s_client -connect scan.coverity.com:443 | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' | sudo tee -a /etc/ssl/certs/ca-
+
+addons:
+  coverity_scan:
+    project:
+      name: "dwmw2/openconnect"
+      description: "OpenConnect VPN client"
+    notification_email: dwmw2@infradead.org
+    build_command_prepend: "./autogen.sh && ./configure"
+    build_command: "make"
+    branch_pattern: coverity_scan
+
+script:
+  - ./autogen.sh
+
